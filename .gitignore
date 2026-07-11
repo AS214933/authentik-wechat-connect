@@ -1,0 +1,6 @@
+.env
+*.pem
+*.key
+/server
+dist/
+tmp/
