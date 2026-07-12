@@ -23,6 +23,11 @@ const (
 	wechatResponseCacheMaxEntries  = 10000
 	wechatPlainSignatureTTL        = 10 * time.Minute
 	wechatPlainSignatureMaxEntries = 10000
+	wechatLoginAttemptWindow       = 5 * time.Minute
+	wechatLoginAttemptMaxFailures  = 5
+	wechatLoginGlobalWindow        = time.Minute
+	wechatLoginGlobalMaxFailures   = 100
+	wechatLoginAttemptMaxEntries   = 10000
 )
 
 type wechatCachedResponse struct {
@@ -34,6 +39,11 @@ type wechatCachedResponse struct {
 type wechatPlainSignatureRecord struct {
 	BodyHash  [sha256.Size]byte
 	ExpiresAt time.Time
+}
+
+type wechatLoginAttempt struct {
+	WindowStart time.Time
+	Failures    int
 }
 
 type wechatEncryptedEnvelope struct {
@@ -310,12 +320,20 @@ func (s *Server) pendingLoginScene(message WeChatInboundMessage) (string, bool, 
 		return "", false, false
 	}
 	s.mu.Lock()
+	now := time.Now()
+	if !s.loginCodeAttemptAllowedLocked(message.FromUserName, now) {
+		s.mu.Unlock()
+		return "", false, false
+	}
 	id, exists := s.loginCodes[code]
 	scan := s.scans[id]
-	accepted := exists && scan != nil && scan.LoginMode == wechatLoginModeMessageCode && scan.User.OpenID == "" && scan.Error == "" && time.Now().Before(scan.ExpiresAt)
+	accepted := exists && scan != nil && scan.LoginMode == wechatLoginModeMessageCode && scan.User.OpenID == "" && scan.Error == "" && now.Before(scan.ExpiresAt)
 	if accepted {
 		scan.ClaimedOpenID = message.FromUserName
 		delete(s.loginCodes, code)
+		delete(s.wechatLoginAttempts, message.FromUserName)
+	} else {
+		s.recordLoginCodeFailureLocked(message.FromUserName, now)
 	}
 	s.mu.Unlock()
 	if !accepted {
@@ -324,21 +342,50 @@ func (s *Server) pendingLoginScene(message WeChatInboundMessage) (string, bool, 
 	return wechatLoginScenePrefix + id, true, true
 }
 
+func (s *Server) loginCodeAttemptAllowedLocked(openID string, now time.Time) bool {
+	if openID == "" {
+		return false
+	}
+	if s.wechatGlobalAttempts.WindowStart.IsZero() || !now.Before(s.wechatGlobalAttempts.WindowStart.Add(wechatLoginGlobalWindow)) {
+		s.wechatGlobalAttempts = wechatLoginAttempt{WindowStart: now}
+	}
+	if s.wechatGlobalAttempts.Failures >= wechatLoginGlobalMaxFailures {
+		return false
+	}
+	attempt, exists := s.wechatLoginAttempts[openID]
+	if !exists || !now.Before(attempt.WindowStart.Add(wechatLoginAttemptWindow)) {
+		return true
+	}
+	return attempt.Failures < wechatLoginAttemptMaxFailures
+}
+
+func (s *Server) recordLoginCodeFailureLocked(openID string, now time.Time) {
+	if s.wechatLoginAttempts == nil {
+		s.wechatLoginAttempts = make(map[string]wechatLoginAttempt)
+	}
+	if s.wechatGlobalAttempts.WindowStart.IsZero() || !now.Before(s.wechatGlobalAttempts.WindowStart.Add(wechatLoginGlobalWindow)) {
+		s.wechatGlobalAttempts = wechatLoginAttempt{WindowStart: now}
+	}
+	s.wechatGlobalAttempts.Failures++
+	attempt, exists := s.wechatLoginAttempts[openID]
+	if !exists || !now.Before(attempt.WindowStart.Add(wechatLoginAttemptWindow)) {
+		if !exists && len(s.wechatLoginAttempts) >= wechatLoginAttemptMaxEntries {
+			for candidate := range s.wechatLoginAttempts {
+				delete(s.wechatLoginAttempts, candidate)
+				break
+			}
+		}
+		attempt = wechatLoginAttempt{WindowStart: now}
+	}
+	attempt.Failures++
+	s.wechatLoginAttempts[openID] = attempt
+}
+
 func loginCodeFromWeChatText(message WeChatInboundMessage) (string, bool) {
 	if !strings.EqualFold(message.MsgType, "text") {
 		return "", false
 	}
-	content := strings.TrimSpace(message.Content)
-	var rawCode string
-	switch {
-	case strings.HasPrefix(content, "登录"):
-		rawCode = strings.TrimSpace(strings.TrimPrefix(content, "登录"))
-	case len(content) >= len("login") && strings.EqualFold(content[:len("login")], "login"):
-		rawCode = strings.TrimSpace(content[len("login"):])
-	default:
-		return "", false
-	}
-	code := normalizeLoginCode(rawCode)
+	code := normalizeLoginCode(message.Content)
 	return code, code != ""
 }
 

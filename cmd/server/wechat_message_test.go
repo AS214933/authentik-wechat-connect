@@ -278,12 +278,138 @@ func TestWeChatAESMessageCodeCompletesLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create message-code scan: %v", err)
 	}
-	body := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>aes-login-user</FromUserName><CreateTime>1720000009</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>10009</MsgId></xml>`, scan.LoginCode)
+	body := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>aes-login-user</FromUserName><CreateTime>1720000009</CreateTime><MsgType>text</MsgType><Content>%s</Content><MsgId>10009</MsgId></xml>`, scan.LoginCode)
 	recorder := performEncryptedWeChatCallback(t, server, body, "1720000009", "login-nonce")
 	assertEncryptedWeChatTextReply(t, server, recorder, "登录已确认，请返回浏览器继续。")
 	completed, ok := server.scanSnapshot(scan.ID)
 	if !ok || completed.User.OpenID != "aes-login-user" || completed.RedirectURL == "" {
 		t.Fatalf("AES message code did not complete login: %#v ok=%t", completed, ok)
+	}
+}
+
+func TestEightDigitLoginCodeFormatAndParsing(t *testing.T) {
+	for value, expected := range map[int64]string{
+		0:        "00000000",
+		1:        "00000001",
+		12345678: "12345678",
+		99999999: "99999999",
+	} {
+		if actual := formatLoginCode(value); actual != expected {
+			t.Errorf("formatLoginCode(%d)=%q want %q", value, actual, expected)
+		}
+	}
+	for i := 0; i < 32; i++ {
+		code, err := randomLoginCode()
+		if err != nil {
+			t.Fatalf("generate login code: %v", err)
+		}
+		if len(code) != 8 || normalizeLoginCode(code) != code {
+			t.Fatalf("generated code is not eight ASCII digits: %q", code)
+		}
+	}
+
+	tests := []struct {
+		name    string
+		message WeChatInboundMessage
+		want    string
+	}{
+		{name: "digits", message: WeChatInboundMessage{MsgType: "text", Content: "12345678"}, want: "12345678"},
+		{name: "leading zero", message: WeChatInboundMessage{MsgType: "text", Content: "00000001"}, want: "00000001"},
+		{name: "leading space", message: WeChatInboundMessage{MsgType: "text", Content: " 12345678"}},
+		{name: "trailing space", message: WeChatInboundMessage{MsgType: "text", Content: "12345678 "}},
+		{name: "seven digits", message: WeChatInboundMessage{MsgType: "text", Content: "1234567"}},
+		{name: "nine digits", message: WeChatInboundMessage{MsgType: "text", Content: "123456789"}},
+		{name: "Chinese prefix", message: WeChatInboundMessage{MsgType: "text", Content: "登录 12345678"}},
+		{name: "English prefix", message: WeChatInboundMessage{MsgType: "text", Content: "LOGIN 12345678"}},
+		{name: "letters", message: WeChatInboundMessage{MsgType: "text", Content: "1234ABCD"}},
+		{name: "full width", message: WeChatInboundMessage{MsgType: "text", Content: "１２３４５６７８"}},
+		{name: "event", message: WeChatInboundMessage{MsgType: "event", Content: "12345678"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual, ok := loginCodeFromWeChatText(test.message)
+			if actual != test.want || ok != (test.want != "") {
+				t.Fatalf("loginCodeFromWeChatText()=(%q,%t) want (%q,%t)", actual, ok, test.want, test.want != "")
+			}
+		})
+	}
+}
+
+func TestMessageCodeTTLIsCapped(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeMessageCode
+	server.cfg.WeChatQRCodeTTL = 24 * time.Hour
+	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
+	if err != nil {
+		t.Fatalf("create message-code scan: %v", err)
+	}
+	if ttl := scan.ExpiresAt.Sub(scan.CreatedAt); ttl != maxWeChatMessageCodeTTL {
+		t.Fatalf("message-code TTL=%s want %s", ttl, maxWeChatMessageCodeTTL)
+	}
+}
+
+func TestLoginCodeInvalidAttemptLimit(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeMessageCode
+	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
+	if err != nil {
+		t.Fatalf("create message-code scan: %v", err)
+	}
+	invalidCode := "00000000"
+	if invalidCode == scan.LoginCode {
+		invalidCode = "99999999"
+	}
+	const openID = "guessing-user"
+	for attempt := 0; attempt < wechatLoginAttemptMaxFailures; attempt++ {
+		if _, _, ok := server.pendingLoginScene(WeChatInboundMessage{MsgType: "text", FromUserName: openID, Content: invalidCode}); ok {
+			t.Fatalf("invalid attempt %d unexpectedly matched", attempt+1)
+		}
+	}
+	if _, _, ok := server.pendingLoginScene(WeChatInboundMessage{MsgType: "text", FromUserName: openID, Content: scan.LoginCode}); ok {
+		t.Fatal("rate-limited OpenID used the correct code before its window expired")
+	}
+	pending, _ := server.scanSnapshot(scan.ID)
+	if pending.ClaimedOpenID != "" {
+		t.Fatalf("rate-limited attempt claimed scan: %#v", pending)
+	}
+
+	server.mu.Lock()
+	attempt := server.wechatLoginAttempts[openID]
+	attempt.WindowStart = time.Now().Add(-wechatLoginAttemptWindow)
+	server.wechatLoginAttempts[openID] = attempt
+	server.mu.Unlock()
+	scene, messageCode, ok := server.pendingLoginScene(WeChatInboundMessage{MsgType: "text", FromUserName: openID, Content: scan.LoginCode})
+	if !ok || !messageCode || scene != wechatLoginScenePrefix+scan.ID {
+		t.Fatalf("correct code after rate-limit reset scene=%q messageCode=%t ok=%t", scene, messageCode, ok)
+	}
+}
+
+func TestLoginCodeGlobalAttemptLimit(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeMessageCode
+	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
+	if err != nil {
+		t.Fatalf("create message-code scan: %v", err)
+	}
+	now := time.Now()
+	server.mu.Lock()
+	server.wechatGlobalAttempts = wechatLoginAttempt{WindowStart: now, Failures: wechatLoginGlobalMaxFailures}
+	server.mu.Unlock()
+	message := WeChatInboundMessage{MsgType: "text", FromUserName: "legitimate-user", Content: scan.LoginCode}
+	if _, _, ok := server.pendingLoginScene(message); ok {
+		t.Fatal("global rate limit allowed a code attempt")
+	}
+	pending, _ := server.scanSnapshot(scan.ID)
+	if pending.ClaimedOpenID != "" {
+		t.Fatalf("globally limited attempt claimed scan: %#v", pending)
+	}
+
+	server.mu.Lock()
+	server.wechatGlobalAttempts.WindowStart = now.Add(-wechatLoginGlobalWindow)
+	server.mu.Unlock()
+	scene, messageCode, ok := server.pendingLoginScene(message)
+	if !ok || !messageCode || scene != wechatLoginScenePrefix+scan.ID {
+		t.Fatalf("correct code after global reset scene=%q messageCode=%t ok=%t", scene, messageCode, ok)
 	}
 }
 
@@ -413,8 +539,8 @@ func TestConcurrentMessageCodeCallbacksConsumeLoginOnce(t *testing.T) {
 		t.Fatalf("create message-code scan: %v", err)
 	}
 	bodies := []string{
-		fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>message-user-a</FromUserName><CreateTime>1720000030</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>1030</MsgId></xml>`, scan.LoginCode),
-		fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>message-user-b</FromUserName><CreateTime>1720000031</CreateTime><MsgType>text</MsgType><Content>LOGIN %s</Content><MsgId>1031</MsgId></xml>`, strings.ReplaceAll(scan.LoginCode, "-", "")),
+		fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>message-user-a</FromUserName><CreateTime>1720000030</CreateTime><MsgType>text</MsgType><Content>%s</Content><MsgId>1030</MsgId></xml>`, scan.LoginCode),
+		fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>message-user-b</FromUserName><CreateTime>1720000031</CreateTime><MsgType>text</MsgType><Content>%s</Content><MsgId>1031</MsgId></xml>`, scan.LoginCode),
 	}
 	start := make(chan struct{})
 	recorders := make([]*httptest.ResponseRecorder, len(bodies))
@@ -481,7 +607,7 @@ func TestPlaintextSignatureCannotBeReusedWithForgedLoginBody(t *testing.T) {
 		t.Fatalf("original callback status=%d body=%s", original.Code, original.Body.String())
 	}
 
-	forgedBody := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>forged-openid</FromUserName><CreateTime>1720000041</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>1041</MsgId></xml>`, scan.LoginCode)
+	forgedBody := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>forged-openid</FromUserName><CreateTime>1720000041</CreateTime><MsgType>text</MsgType><Content>%s</Content><MsgId>1041</MsgId></xml>`, scan.LoginCode)
 	forged := httptest.NewRecorder()
 	server.Routes().ServeHTTP(forged, httptest.NewRequest(http.MethodPost, target, strings.NewReader(forgedBody)))
 	if forged.Code != http.StatusForbidden {

@@ -151,10 +151,10 @@ func TestAuthorizeFallsBackToOfficialAccountMessageCodeOnQRCode48001(t *testing.
 
 	pageRec := httptest.NewRecorder()
 	server.Routes().ServeHTTP(pageRec, httptest.NewRequest(http.MethodGet, "/scan/"+scanID, nil))
-	if pageRec.Code != http.StatusOK || !strings.Contains(pageRec.Body.String(), "登录 "+scan.LoginCode) || !strings.Contains(pageRec.Body.String(), "测试公众号") {
+	if pageRec.Code != http.StatusOK || !strings.Contains(pageRec.Body.String(), ">"+scan.LoginCode+"</code>") || !strings.Contains(pageRec.Body.String(), "测试公众号") {
 		t.Fatalf("fallback page status=%d body=%s", pageRec.Code, pageRec.Body.String())
 	}
-	if !strings.Contains(pageRec.Body.String(), `const scanID = "`+scanID+`";`) || !strings.Contains(pageRec.Body.String(), `clipboard.writeText("登录 `+scan.LoginCode+`")`) {
+	if !strings.Contains(pageRec.Body.String(), `const scanID = "`+scanID+`";`) || !strings.Contains(pageRec.Body.String(), `clipboard.writeText("`+scan.LoginCode+`")`) {
 		t.Fatalf("fallback page encoded JavaScript values incorrectly: %s", pageRec.Body.String())
 	}
 
@@ -168,7 +168,7 @@ func TestAuthorizeFallsBackToOfficialAccountMessageCodeOnQRCode48001(t *testing.
 		t.Fatalf("SCAN incorrectly completed message-code session: %#v", pending)
 	}
 
-	messageBody := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>openid-message</FromUserName><CreateTime>1720000091</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>9001</MsgId></xml>`, scan.LoginCode)
+	messageBody := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>openid-message</FromUserName><CreateTime>1720000091</CreateTime><MsgType>text</MsgType><Content>%s</Content><MsgId>9001</MsgId></xml>`, scan.LoginCode)
 	messageRec := performSignedWeChatCallback(t, server, messageBody)
 	if messageRec.Code != http.StatusOK || !strings.Contains(messageRec.Body.String(), "登录已确认") {
 		t.Fatalf("message callback status=%d body=%s", messageRec.Code, messageRec.Body.String())

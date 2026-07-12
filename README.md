@@ -12,7 +12,7 @@ A Go middleware service that turns WeChat Official Account QR-code login into a 
 6. The scan page polls until the callback arrives, shows a successful binding/login state, and redirects back to the Authentik Source callback.
 7. Authentik calls `/oauth/token` and `/oauth/userinfo` to finish login or account binding.
 
-WeChat only authorizes `qrcode/create` for verified Service Accounts. With the default `WECHAT_LOGIN_MODE=auto`, error `48001` switches this process to an Official Account message-code flow: the page displays the configured permanent account QR code and a one-time code, and the user sends `登录 <code>` to the account. The validated message callback supplies the OpenID and completes the same browser session. This extra message is necessary because an ordinary account QR code has no per-login scene.
+WeChat only authorizes `qrcode/create` for verified Service Accounts. With the default `WECHAT_LOGIN_MODE=auto`, error `48001` switches this process to an Official Account message-code flow: the page displays the configured permanent account QR code and an eight-digit one-time code, and the user sends those eight digits directly to the account. The validated message callback supplies the OpenID and completes the same browser session. This extra message is necessary because an ordinary account QR code has no per-login scene.
 
 ## Endpoints
 
@@ -62,7 +62,7 @@ For verified Service Accounts, the service uses temporary parameterized QR codes
 - `parameter_qr` requires a verified Service Account and never falls back.
 - `message_code` skips the restricted QR API and always uses the ordinary Official Account message flow.
 
-For `auto` fallback or `message_code`, set `WECHAT_ACCOUNT_QR_CODE_URL` to an absolute HTTP(S) URL containing the permanent QR image downloaded from the Official Account console. It must use HTTPS when `PUBLIC_URL` does. `WECHAT_ACCOUNT_NAME` is optional display text. Without an image URL, the login page still shows the one-time code and asks the user to enter the configured account manually. Codes contain 64 random bits, expire with `WECHAT_QR_CODE_TTL`, are consumed once, and only callbacks accepted by the configured plaintext/AES transport validation can use them. A bare `subscribe` event or a menu `CLICK` never guesses or completes a message-code session.
+For `auto` fallback or `message_code`, set `WECHAT_ACCOUNT_QR_CODE_URL` to an absolute HTTP(S) URL containing the permanent QR image downloaded from the Official Account console. It must use HTTPS when `PUBLIC_URL` does. `WECHAT_ACCOUNT_NAME` is optional display text. Without an image URL, the login page still shows the one-time code and asks the user to enter the configured account manually. Each login uses an eight-digit one-time numeric code (including possible leading zeroes), sent as the entire message without a prefix. It expires with `WECHAT_QR_CODE_TTL` (capped at 10 minutes for numeric codes) and is consumed once. Invalid guesses are limited per OpenID and globally. Only callbacks accepted by the configured plaintext/AES transport validation can use the code. A bare `subscribe` event or a menu `CLICK` never guesses or completes a message-code session.
 
 ## Replies And Menu Management
 
@@ -136,7 +136,7 @@ Do not set `PUBLIC_URL`, `OIDC_ISSUER`, or `OIDC_ALLOWED_REDIRECT_URIS` to an Au
 | `WECHAT_LOGIN_MODE` | `auto`, `parameter_qr`, or `message_code` | `auto` |
 | `WECHAT_ACCOUNT_NAME` | Account name shown by the message-code login page | empty |
 | `WECHAT_ACCOUNT_QR_CODE_URL` | Absolute HTTP(S) URL of the permanent account QR image used by message-code login | empty |
-| `WECHAT_QR_CODE_TTL` | Temporary QR-code lifetime, maximum 30 days | `5m` |
+| `WECHAT_QR_CODE_TTL` | Temporary parameter-QR lifetime (maximum 30 days); numeric message codes are capped at 10 minutes | `5m` |
 | `WECHAT_USER_INFO_LANG` | WeChat user-info language | `zh_CN` |
 | `WECHAT_CALLBACK_TIMEOUT` | Maximum user-profile lookup time inside the 5-second callback window; maximum 4 seconds | `3s` |
 | `WECHAT_ADMIN_TOKEN` | Independent Bearer token for the WeChat management API; 32+ bytes in production | empty (management API disabled) |

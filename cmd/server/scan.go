@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const wechatLoginScenePrefix = "login:"
+const (
+	wechatLoginScenePrefix  = "login:"
+	maxWeChatMessageCodeTTL = 10 * time.Minute
+)
 
 var scanPageTemplate = template.Must(template.New("scan").Parse(`<!doctype html>
 <html lang="zh-CN">
@@ -53,12 +56,12 @@ var scanPageTemplate = template.Must(template.New("scan").Parse(`<!doctype html>
     {{if .UsesMessageCode}}
     <h1>在公众号内确认登录</h1>
     {{if .QRImageURL}}
-    <p>扫描{{if .AccountName}}「{{.AccountName}}」{{end}}公众号二维码，关注或进入公众号后发送下方口令。</p>
+    <p>扫描{{if .AccountName}}「{{.AccountName}}」{{end}}公众号二维码，关注或进入公众号后直接发送下方八位数字码。</p>
     <div class="qr"><img src="{{.QRImageURL}}" alt="公众号二维码"></div>
     {{else}}
-    {{if .AccountName}}<p>进入「{{.AccountName}}」公众号，在聊天窗口发送下方口令。</p>{{else}}<p class="warning">公众号入口尚未配置。请联系管理员设置 WECHAT_ACCOUNT_QR_CODE_URL 或 WECHAT_ACCOUNT_NAME；若你已知道对应公众号，可直接发送下方口令。</p>{{end}}
+    {{if .AccountName}}<p>进入「{{.AccountName}}」公众号，在聊天窗口直接发送下方八位数字码。</p>{{else}}<p class="warning">公众号入口尚未配置。请联系管理员设置 WECHAT_ACCOUNT_QR_CODE_URL 或 WECHAT_ACCOUNT_NAME；若你已知道对应公众号，可直接发送下方八位数字码。</p>{{end}}
     {{end}}
-    <div class="code"><code>登录 {{.LoginCode}}</code><button id="copy-code" class="copy" type="button">复制</button></div>
+    <div class="code"><code>{{.LoginCode}}</code><button id="copy-code" class="copy" type="button">复制</button></div>
     {{else}}
     <h1>请使用微信扫码登录</h1>
     <p>扫码后页面会自动完成绑定/登录并返回 Authentik。</p>
@@ -66,7 +69,7 @@ var scanPageTemplate = template.Must(template.New("scan").Parse(`<!doctype html>
     {{end}}
     <div id="status" class="status">
       <div class="dot"></div>
-      <div><strong id="status-title">{{if .UsesMessageCode}}等待公众号消息{{else}}等待扫码确认{{end}}</strong><span id="status-detail">{{if .UsesMessageCode}}登录口令{{else}}二维码{{end}}将在 {{.ExpiresInSeconds}} 秒后过期</span></div>
+      <div><strong id="status-title">{{if .UsesMessageCode}}等待公众号消息{{else}}等待扫码确认{{end}}</strong><span id="status-detail">{{if .UsesMessageCode}}八位数字码{{else}}二维码{{end}}将在 {{.ExpiresInSeconds}} 秒后过期</span></div>
     </div>
     <div class="actions"><a class="button" href="/">返回首页</a></div>
   </main>
@@ -181,6 +184,10 @@ func (s *Server) createScanSession(ctx context.Context, kind string, oidc oidcAu
 
 func (s *Server) createMessageCodeSession(id, kind string, oidc oidcAuthRequest, returnTo string) (scanSession, error) {
 	now := time.Now()
+	ttl := s.cfg.WeChatQRCodeTTL
+	if ttl > maxWeChatMessageCodeTTL {
+		ttl = maxWeChatMessageCodeTTL
+	}
 	for attempts := 0; attempts < 4; attempts++ {
 		code, err := randomLoginCode()
 		if err != nil {
@@ -196,7 +203,7 @@ func (s *Server) createMessageCodeSession(id, kind string, oidc oidcAuthRequest,
 			LoginMode:  wechatLoginModeMessageCode,
 			LoginCode:  code,
 			CreatedAt:  now,
-			ExpiresAt:  now.Add(s.cfg.WeChatQRCodeTTL),
+			ExpiresAt:  now.Add(ttl),
 		}
 		s.mu.Lock()
 		if _, exists := s.loginCodes[normalized]; !exists {
@@ -241,7 +248,7 @@ func (s *Server) handleScanPage(w http.ResponseWriter, r *http.Request) {
 		UsesMessageCode:  scan.LoginMode == wechatLoginModeMessageCode,
 		AccountName:      s.cfg.WeChatAccountName,
 		LoginCode:        scan.LoginCode,
-		LoginMessage:     "登录 " + scan.LoginCode,
+		LoginMessage:     scan.LoginCode,
 		ExpiresInSeconds: expiresIn,
 	}); err != nil {
 		logOAuthWarning(r, "render scan page failed scan_id_fp=%s: %v", tokenFingerprint(id), err)

@@ -6,12 +6,12 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -36,6 +36,8 @@ type Server struct {
 	wechatResponses       map[string]wechatCachedResponse
 	wechatInFlight        map[string]chan struct{}
 	wechatPlainSignatures map[string]wechatPlainSignatureRecord
+	wechatLoginAttempts   map[string]wechatLoginAttempt
+	wechatGlobalAttempts  wechatLoginAttempt
 	loginCodes            map[string]string
 	qrUnauthorized        bool
 }
@@ -169,6 +171,7 @@ func NewServer(cfg Config) (*Server, error) {
 		wechatResponses:       make(map[string]wechatCachedResponse),
 		wechatInFlight:        make(map[string]chan struct{}),
 		wechatPlainSignatures: make(map[string]wechatPlainSignatureRecord),
+		wechatLoginAttempts:   make(map[string]wechatLoginAttempt),
 		loginCodes:            make(map[string]string),
 	}
 	go s.cleanupLoop()
@@ -427,6 +430,11 @@ func (s *Server) cleanupExpired() {
 			delete(s.wechatPlainSignatures, key)
 		}
 	}
+	for openID, attempt := range s.wechatLoginAttempts {
+		if now.After(attempt.WindowStart.Add(wechatLoginAttemptWindow)) {
+			delete(s.wechatLoginAttempts, openID)
+		}
+	}
 }
 
 func randomToken(bytes int) (string, error) {
@@ -438,22 +446,23 @@ func randomToken(bytes int) (string, error) {
 }
 
 func randomLoginCode() (string, error) {
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
+	value, err := rand.Int(rand.Reader, big.NewInt(100_000_000))
+	if err != nil {
 		return "", err
 	}
-	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf)
-	return encoded[:4] + "-" + encoded[4:8] + "-" + encoded[8:], nil
+	return formatLoginCode(value.Int64()), nil
+}
+
+func formatLoginCode(value int64) string {
+	return fmt.Sprintf("%08d", value)
 }
 
 func normalizeLoginCode(value string) string {
-	value = strings.ToUpper(strings.TrimSpace(value))
-	value = strings.NewReplacer("-", "", " ", "", "\t", "", "\r", "", "\n", "").Replace(value)
-	if len(value) != 13 {
+	if len(value) != 8 {
 		return ""
 	}
 	for _, char := range value {
-		if (char < 'A' || char > 'Z') && (char < '2' || char > '7') {
+		if char < '0' || char > '9' {
 			return ""
 		}
 	}
