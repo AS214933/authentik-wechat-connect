@@ -148,14 +148,14 @@ func TestFullOIDCFlowThroughWeChatEventCallback(t *testing.T) {
 	}
 
 	callbackBody := fmt.Sprintf(`<xml>
-<ToUserName><![CDATA[gh_test]]></ToUserName>
-<FromUserName><![CDATA[openid-123]]></FromUserName>
-<CreateTime>1720000000</CreateTime>
-<MsgType><![CDATA[event]]></MsgType>
-<Event><![CDATA[SCAN]]></Event>
-<EventKey><![CDATA[%s]]></EventKey>
-<Ticket><![CDATA[ticket-%s]]></Ticket>
-</xml>`, scanID, scanID)
+	<ToUserName><![CDATA[gh_test]]></ToUserName>
+	<FromUserName><![CDATA[openid-123]]></FromUserName>
+	<CreateTime>1720000000</CreateTime>
+	<MsgType><![CDATA[event]]></MsgType>
+	<Event><![CDATA[SCAN]]></Event>
+	<EventKey><![CDATA[%s]]></EventKey>
+	<Ticket><![CDATA[ticket-%s]]></Ticket>
+	</xml>`, wechatLoginScenePrefix+scanID, scanID)
 	callbackReq := signedWeChatRequest(server, http.MethodPost, "/wechat/callback", strings.NewReader(callbackBody))
 	callbackRec := httptest.NewRecorder()
 	server.Routes().ServeHTTP(callbackRec, callbackReq)

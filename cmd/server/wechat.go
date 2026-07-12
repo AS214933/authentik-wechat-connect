@@ -3,17 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,21 +28,30 @@ type WeChatQRCode struct {
 type WeChatClient struct {
 	cfg Config
 
-	httpClient       *http.Client
-	tokenEndpoint    string
-	qrCodeEndpoint   string
-	userInfoEndpoint string
+	httpClient          *http.Client
+	tokenEndpoint       string
+	qrCodeEndpoint      string
+	userInfoEndpoint    string
+	menuCreateEndpoint  string
+	menuGetEndpoint     string
+	menuCurrentEndpoint string
+	menuDeleteEndpoint  string
 
-	mu          sync.Mutex
-	accessToken string
-	tokenExpiry time.Time
+	mu           sync.Mutex
+	accessToken  string
+	tokenExpiry  time.Time
+	tokenRefresh chan struct{}
 }
 
 const (
-	defaultWeChatTokenEndpoint    = "https://api.weixin.qq.com/cgi-bin/token"
-	defaultWeChatQRCodeEndpoint   = "https://api.weixin.qq.com/cgi-bin/qrcode/create"
-	defaultWeChatUserInfoEndpoint = "https://api.weixin.qq.com/cgi-bin/user/info"
-	defaultWeChatQRCodeImageURL   = "https://mp.weixin.qq.com/cgi-bin/showqrcode"
+	defaultWeChatTokenEndpoint       = "https://api.weixin.qq.com/cgi-bin/token"
+	defaultWeChatQRCodeEndpoint      = "https://api.weixin.qq.com/cgi-bin/qrcode/create"
+	defaultWeChatUserInfoEndpoint    = "https://api.weixin.qq.com/cgi-bin/user/info"
+	defaultWeChatQRCodeImageURL      = "https://mp.weixin.qq.com/cgi-bin/showqrcode"
+	defaultWeChatMenuCreateEndpoint  = "https://api.weixin.qq.com/cgi-bin/menu/create"
+	defaultWeChatMenuGetEndpoint     = "https://api.weixin.qq.com/cgi-bin/menu/get"
+	defaultWeChatMenuCurrentEndpoint = "https://api.weixin.qq.com/cgi-bin/get_current_selfmenu_info"
+	defaultWeChatMenuDeleteEndpoint  = "https://api.weixin.qq.com/cgi-bin/menu/delete"
 )
 
 type wechatTokenResponse struct {
@@ -80,24 +83,16 @@ type wechatUserInfoResponse struct {
 	ErrMsg     string `json:"errmsg"`
 }
 
-type wechatEventMessage struct {
-	XMLName      xml.Name `xml:"xml"`
-	ToUserName   string   `xml:"ToUserName"`
-	FromUserName string   `xml:"FromUserName"`
-	CreateTime   int64    `xml:"CreateTime"`
-	MsgType      string   `xml:"MsgType"`
-	Event        string   `xml:"Event"`
-	EventKey     string   `xml:"EventKey"`
-	Ticket       string   `xml:"Ticket"`
-	Encrypt      string   `xml:"Encrypt"`
-}
-
 func NewWeChatClient(cfg Config) *WeChatClient {
 	return &WeChatClient{
-		cfg:              cfg,
-		tokenEndpoint:    defaultWeChatTokenEndpoint,
-		qrCodeEndpoint:   defaultWeChatQRCodeEndpoint,
-		userInfoEndpoint: defaultWeChatUserInfoEndpoint,
+		cfg:                 cfg,
+		tokenEndpoint:       defaultWeChatTokenEndpoint,
+		qrCodeEndpoint:      defaultWeChatQRCodeEndpoint,
+		userInfoEndpoint:    defaultWeChatUserInfoEndpoint,
+		menuCreateEndpoint:  defaultWeChatMenuCreateEndpoint,
+		menuGetEndpoint:     defaultWeChatMenuGetEndpoint,
+		menuCurrentEndpoint: defaultWeChatMenuCurrentEndpoint,
+		menuDeleteEndpoint:  defaultWeChatMenuDeleteEndpoint,
 		httpClient: &http.Client{
 			Timeout: 12 * time.Second,
 		},
@@ -204,17 +199,45 @@ func (c *WeChatClient) FetchUser(ctx context.Context, openID string) (User, erro
 }
 
 func (c *WeChatClient) getAccessToken(ctx context.Context) (string, error) {
-	c.mu.Lock()
-	if c.accessToken != "" && time.Now().Before(c.tokenExpiry) {
-		token := c.accessToken
+	for {
+		c.mu.Lock()
+		if c.accessToken != "" && time.Now().Before(c.tokenExpiry) {
+			token := c.accessToken
+			c.mu.Unlock()
+			return token, nil
+		}
+		if wait := c.tokenRefresh; wait != nil {
+			c.mu.Unlock()
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+		refresh := make(chan struct{})
+		c.tokenRefresh = refresh
 		c.mu.Unlock()
-		return token, nil
-	}
-	c.mu.Unlock()
 
+		token, expiry, err := c.fetchAccessToken(ctx)
+		c.mu.Lock()
+		if err == nil {
+			c.accessToken = token
+			c.tokenExpiry = expiry
+		}
+		if c.tokenRefresh == refresh {
+			c.tokenRefresh = nil
+			close(refresh)
+		}
+		c.mu.Unlock()
+		return token, err
+	}
+}
+
+func (c *WeChatClient) fetchAccessToken(ctx context.Context) (string, time.Time, error) {
 	u, err := endpointURL(c.tokenEndpoint, defaultWeChatTokenEndpoint)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	q := u.Query()
 	q.Set("grant_type", "client_credential")
@@ -224,17 +247,17 @@ func (c *WeChatClient) getAccessToken(ctx context.Context) (string, error) {
 
 	body, err := c.do(ctx, http.MethodGet, u.String(), "", nil)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	var result wechatTokenResponse
 	if err := json.Unmarshal([]byte(body), &result); err != nil {
-		return "", fmt.Errorf("decode WeChat access token response: %w", err)
+		return "", time.Time{}, fmt.Errorf("decode WeChat access token response: %w", err)
 	}
 	if result.ErrCode != 0 {
-		return "", fmt.Errorf("WeChat access token error %d: %s", result.ErrCode, result.ErrMsg)
+		return "", time.Time{}, fmt.Errorf("WeChat access token error %d: %s", result.ErrCode, result.ErrMsg)
 	}
 	if result.AccessToken == "" {
-		return "", fmt.Errorf("WeChat access token response did not include access_token")
+		return "", time.Time{}, fmt.Errorf("WeChat access token response did not include access_token")
 	}
 	expiresIn := time.Duration(result.ExpiresIn) * time.Second
 	if expiresIn <= 0 {
@@ -244,11 +267,17 @@ func (c *WeChatClient) getAccessToken(ctx context.Context) (string, error) {
 	if !expiry.After(time.Now()) {
 		expiry = time.Now().Add(expiresIn / 2)
 	}
+	return result.AccessToken, expiry, nil
+}
+
+func (c *WeChatClient) invalidateAccessToken(token string) {
 	c.mu.Lock()
-	c.accessToken = result.AccessToken
-	c.tokenExpiry = expiry
-	c.mu.Unlock()
-	return result.AccessToken, nil
+	defer c.mu.Unlock()
+	if c.accessToken != token {
+		return
+	}
+	c.accessToken = ""
+	c.tokenExpiry = time.Time{}
 }
 
 func (c *WeChatClient) do(ctx context.Context, method, rawURL, contentType string, body io.Reader) (string, error) {
@@ -305,124 +334,5 @@ func wechatGender(sex int) string {
 		return "female"
 	default:
 		return ""
-	}
-}
-
-func (s *Server) handleWeChatCallback(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.WeChatCallbackToken == "" {
-		logOAuthWarning(r, "wechat callback rejected: WECHAT_CALLBACK_TOKEN is not configured")
-		publicError(w, http.StatusServiceUnavailable, fmt.Errorf("WECHAT_CALLBACK_TOKEN must be configured"))
-		return
-	}
-	query := r.URL.Query()
-	signature := query.Get("signature")
-	timestamp := query.Get("timestamp")
-	nonce := query.Get("nonce")
-	if !verifyWeChatSignature(s.cfg.WeChatCallbackToken, timestamp, nonce, signature) {
-		logOAuthWarning(r, "wechat callback rejected: signature verification failed")
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	if r.Method == http.MethodGet {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte(query.Get("echostr")))
-		return
-	}
-
-	if strings.EqualFold(query.Get("encrypt_type"), "aes") {
-		logOAuthWarning(r, "wechat callback rejected: encrypted callbacks are not supported")
-		http.Error(w, "encrypted WeChat callbacks are not supported; configure plaintext mode", http.StatusUnsupportedMediaType)
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		logOAuthWarning(r, "wechat callback rejected: read body: %v", err)
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	var event wechatEventMessage
-	if err := xml.Unmarshal(body, &event); err != nil {
-		logOAuthWarning(r, "wechat callback rejected: decode XML: %v", err)
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if event.Encrypt != "" {
-		logOAuthWarning(r, "wechat callback rejected: encrypted message payload is not supported")
-		http.Error(w, "encrypted WeChat callbacks are not supported; configure plaintext mode", http.StatusUnsupportedMediaType)
-		return
-	}
-
-	scene, ok := sceneFromWeChatEvent(event)
-	if !ok {
-		logOAuthInfo(r, "wechat callback ignored: msg_type=%q event=%q", event.MsgType, event.Event)
-		writeWeChatSuccess(w)
-		return
-	}
-	if event.FromUserName == "" {
-		logOAuthWarning(r, "wechat callback ignored: scan scene=%q missing FromUserName", scene)
-		writeWeChatSuccess(w)
-		return
-	}
-
-	user := User{OpenID: event.FromUserName}
-	if fetched, err := s.wx.FetchUser(r.Context(), event.FromUserName); err == nil {
-		user = fetched
-	} else {
-		log.Printf("wechat user info lookup failed openid_fp=%s: %v", tokenFingerprint(event.FromUserName), err)
-	}
-	if err := s.completeScan(r, scene, user); err != nil {
-		logOAuthWarning(r, "wechat callback scan completion ignored scene_fp=%s openid_fp=%s: %v", tokenFingerprint(scene), tokenFingerprint(event.FromUserName), err)
-	} else {
-		logOAuthInfo(r, "wechat callback completed scan scene_fp=%s openid_fp=%s", tokenFingerprint(scene), tokenFingerprint(event.FromUserName))
-	}
-	writeWeChatSuccess(w)
-}
-
-func writeWeChatSuccess(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("success"))
-}
-
-func verifyWeChatSignature(token, timestamp, nonce, signature string) bool {
-	if token == "" || timestamp == "" || nonce == "" || signature == "" {
-		return false
-	}
-	parts := []string{token, timestamp, nonce}
-	sort.Strings(parts)
-	sum := sha1.Sum([]byte(strings.Join(parts, "")))
-	expected := hex.EncodeToString(sum[:])
-	return hmac.Equal([]byte(expected), []byte(strings.ToLower(signature)))
-}
-
-func signWeChatCallbackURL(callbackURL, token string) string {
-	timestamp := fmt.Sprint(time.Now().Unix())
-	nonce := fmt.Sprint(time.Now().UnixNano())
-	parts := []string{token, timestamp, nonce}
-	sort.Strings(parts)
-	sum := sha1.Sum([]byte(strings.Join(parts, "")))
-	u, _ := url.Parse(callbackURL)
-	q := u.Query()
-	q.Set("signature", hex.EncodeToString(sum[:]))
-	q.Set("timestamp", timestamp)
-	q.Set("nonce", nonce)
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func sceneFromWeChatEvent(event wechatEventMessage) (string, bool) {
-	if strings.ToLower(event.MsgType) != "event" {
-		return "", false
-	}
-	switch strings.ToUpper(event.Event) {
-	case "SCAN":
-		return strings.TrimSpace(event.EventKey), strings.TrimSpace(event.EventKey) != ""
-	case "SUBSCRIBE":
-		key := strings.TrimSpace(event.EventKey)
-		key = strings.TrimPrefix(key, "qrscene_")
-		return key, key != ""
-	default:
-		return "", false
 	}
 }

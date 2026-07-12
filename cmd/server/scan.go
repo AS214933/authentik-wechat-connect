@@ -5,8 +5,11 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
+
+const wechatLoginScenePrefix = "login:"
 
 var scanPageTemplate = template.Must(template.New("scan").Parse(`<!doctype html>
 <html lang="zh-CN">
@@ -97,7 +100,7 @@ func (s *Server) createScanSession(ctx context.Context, kind string, oidc oidcAu
 	if err != nil {
 		return scanSession{}, err
 	}
-	qr, err := s.wx.CreateLoginQRCode(ctx, id, s.cfg.WeChatQRCodeTTL)
+	qr, err := s.wx.CreateLoginQRCode(ctx, wechatLoginScenePrefix+id, s.cfg.WeChatQRCodeTTL)
 	if err != nil {
 		return scanSession{}, err
 	}
@@ -182,6 +185,11 @@ func (s *Server) scanSnapshot(id string) (scanSession, bool) {
 }
 
 func (s *Server) completeScan(r *http.Request, scene string, user User) error {
+	scene = strings.TrimSpace(scene)
+	if !strings.HasPrefix(scene, wechatLoginScenePrefix) {
+		return errScanNotFound
+	}
+	scene = strings.TrimPrefix(scene, wechatLoginScenePrefix)
 	if scene == "" {
 		return errScanNotFound
 	}
@@ -294,5 +302,5 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authentik WeChat Connect</title><style>body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f7fa;color:#17233d;display:grid;place-items:center;padding:24px}.panel{width:min(520px,100%);background:#fff;border:1px solid #dfe4ea;border-radius:8px;padding:28px;box-shadow:0 16px 48px rgba(23,35,61,.08)}h1{font-size:24px;margin:0 0 10px}p{color:#6b778c;line-height:1.6}.actions{display:flex;gap:10px;margin-top:20px}a,button{height:40px;padding:0 14px;border-radius:7px;border:1px solid #dfe4ea;background:#fff;color:#17233d;text-decoration:none;display:inline-flex;align-items:center;cursor:pointer}.primary{background:#07c160;color:#fff;border-color:#07c160}</style></head><body><main class="panel"><h1>Authentik WeChat Connect</h1><p>OIDC discovery、微信扫码登录和公众号事件回调已就绪。</p><div class="actions"><a class="primary" href="/login/wechat">微信登录</a><a href="/.well-known/openid-configuration">Discovery</a></div></main></body></html>`))
+	_, _ = w.Write([]byte(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authentik WeChat Connect</title><style>body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f7fa;color:#17233d;display:grid;place-items:center;padding:24px}.panel{width:min(520px,100%);background:#fff;border:1px solid #dfe4ea;border-radius:8px;padding:28px;box-shadow:0 16px 48px rgba(23,35,61,.08)}h1{font-size:24px;margin:0 0 10px}p{color:#6b778c;line-height:1.6}.actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:20px}a{height:40px;padding:0 14px;border-radius:7px;border:1px solid #dfe4ea;background:#fff;color:#17233d;text-decoration:none;display:inline-flex;align-items:center}.primary{background:#07c160;color:#fff;border-color:#07c160}</style></head><body><main class="panel"><h1>Authentik WeChat Connect</h1><p>OIDC、微信参数二维码登录、消息回复和自定义菜单管理已就绪。</p><div class="actions"><a class="primary" href="/login/wechat">微信登录</a><a href="/admin/wechat">公众号管理</a><a href="/.well-known/openid-configuration">Discovery</a></div></main></body></html>`))
 }

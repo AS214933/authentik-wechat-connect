@@ -16,11 +16,15 @@ type Config struct {
 	ListenAddr string
 	PublicURL  string
 
-	WeChatAppID         string
-	WeChatAppSecret     string
-	WeChatCallbackToken string
-	WeChatQRCodeTTL     time.Duration
-	WeChatUserInfoLang  string
+	WeChatAppID              string
+	WeChatAppSecret          string
+	WeChatCallbackToken      string
+	WeChatEncodingAESKey     string
+	WeChatQRCodeTTL          time.Duration
+	WeChatUserInfoLang       string
+	WeChatCallbackTimeout    time.Duration
+	WeChatManagementDataFile string
+	WeChatAdminToken         string
 
 	OIDCIssuer                    string
 	OIDCClientID                  string
@@ -58,6 +62,10 @@ func loadConfig() (Config, error) {
 	if err := validateWeChatQRCodeTTL(qrTTL); err != nil {
 		return Config{}, err
 	}
+	callbackTimeout := envDuration("WECHAT_CALLBACK_TIMEOUT", 3*time.Second)
+	if err := validateWeChatCallbackTimeout(callbackTimeout); err != nil {
+		return Config{}, err
+	}
 
 	sessionSecret := []byte(os.Getenv("SESSION_SECRET"))
 	if len(sessionSecret) == 0 {
@@ -74,11 +82,15 @@ func loadConfig() (Config, error) {
 		ListenAddr: env("LISTEN_ADDR", ":8080"),
 		PublicURL:  publicURL,
 
-		WeChatAppID:         os.Getenv("WECHAT_APP_ID"),
-		WeChatAppSecret:     os.Getenv("WECHAT_APP_SECRET"),
-		WeChatCallbackToken: os.Getenv("WECHAT_CALLBACK_TOKEN"),
-		WeChatQRCodeTTL:     qrTTL,
-		WeChatUserInfoLang:  env("WECHAT_USER_INFO_LANG", "zh_CN"),
+		WeChatAppID:              os.Getenv("WECHAT_APP_ID"),
+		WeChatAppSecret:          os.Getenv("WECHAT_APP_SECRET"),
+		WeChatCallbackToken:      os.Getenv("WECHAT_CALLBACK_TOKEN"),
+		WeChatEncodingAESKey:     strings.TrimSpace(os.Getenv("WECHAT_ENCODING_AES_KEY")),
+		WeChatQRCodeTTL:          qrTTL,
+		WeChatUserInfoLang:       env("WECHAT_USER_INFO_LANG", "zh_CN"),
+		WeChatCallbackTimeout:    callbackTimeout,
+		WeChatManagementDataFile: env("WECHAT_MANAGEMENT_DATA_FILE", "data/wechat-management.json"),
+		WeChatAdminToken:         strings.TrimSpace(os.Getenv("WECHAT_ADMIN_TOKEN")),
 
 		OIDCIssuer:                    issuer,
 		OIDCClientID:                  env("OIDC_CLIENT_ID", "authentik"),
@@ -103,6 +115,11 @@ func loadConfig() (Config, error) {
 	if cfg.OIDCClientSecret == "change-me" {
 		log.Println("OIDC_CLIENT_SECRET is using the development default; set a strong value before production use")
 	}
+	if cfg.WeChatAdminToken == "" {
+		log.Println("WECHAT_ADMIN_TOKEN is not set; WeChat management APIs are disabled")
+	} else if len(cfg.WeChatAdminToken) < 32 {
+		log.Println("WECHAT_ADMIN_TOKEN should be at least 32 bytes; short tokens are accepted only for local development")
+	}
 	if len(cfg.OIDCAllowedRedirectURIs) == 0 && !cfg.OIDCInsecureAllowAllRedirects {
 		log.Println("OIDC_ALLOWED_REDIRECT_URIS is empty; Authentik authorization requests will be rejected until it is configured")
 	}
@@ -115,6 +132,9 @@ func loadConfig() (Config, error) {
 func validateProductionConfig(cfg Config) error {
 	if isLocalServiceURL(cfg.PublicURL) {
 		return nil
+	}
+	if cfg.WeChatAdminToken != "" && len(cfg.WeChatAdminToken) < 32 {
+		return fmt.Errorf("WECHAT_ADMIN_TOKEN must be at least 32 bytes for non-local PUBLIC_URL %q", cfg.PublicURL)
 	}
 	if os.Getenv("SESSION_SECRET") == "" {
 		return fmt.Errorf("SESSION_SECRET must be set for non-local PUBLIC_URL %q so authorization codes and access tokens survive restarts", cfg.PublicURL)
@@ -176,6 +196,13 @@ func validateWeChatQRCodeTTL(ttl time.Duration) error {
 	}
 	if ttl > maxWeChatTemporaryQRCodeTTL {
 		return fmt.Errorf("WECHAT_QR_CODE_TTL must not exceed %s for temporary WeChat QR codes", maxWeChatTemporaryQRCodeTTL)
+	}
+	return nil
+}
+
+func validateWeChatCallbackTimeout(timeout time.Duration) error {
+	if timeout <= 0 || timeout > 4*time.Second {
+		return fmt.Errorf("WECHAT_CALLBACK_TIMEOUT must be greater than zero and no more than 4s")
 	}
 	return nil
 }

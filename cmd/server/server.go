@@ -19,16 +19,21 @@ import (
 )
 
 type Server struct {
-	cfg    Config
-	wx     wechatService
-	signer *JWTSigner
+	cfg        Config
+	wx         wechatService
+	wxMenu     wechatMenuService
+	signer     *JWTSigner
+	management *wechatManagementStore
+	wxCryptor  *wechatCryptor
 
-	mu           sync.Mutex
-	scans        map[string]*scanSession
-	authCodes    map[string]authCode
-	accessTokens map[string]accessSession
-	webSessions  map[string]webSession
-	usedTokens   map[string]time.Time
+	mu              sync.Mutex
+	scans           map[string]*scanSession
+	authCodes       map[string]authCode
+	accessTokens    map[string]accessSession
+	webSessions     map[string]webSession
+	usedTokens      map[string]time.Time
+	wechatResponses map[string]wechatCachedResponse
+	wechatInFlight  map[string]chan struct{}
 }
 
 type scanSession struct {
@@ -129,15 +134,32 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	management, err := newWeChatManagementStore(cfg.WeChatManagementDataFile)
+	if err != nil {
+		return nil, fmt.Errorf("load WeChat management data: %w", err)
+	}
+	var cryptor *wechatCryptor
+	if cfg.WeChatEncodingAESKey != "" {
+		cryptor, err = newWeChatCryptor(cfg.WeChatAppID, cfg.WeChatEncodingAESKey)
+		if err != nil {
+			return nil, fmt.Errorf("configure WeChat callback encryption: %w", err)
+		}
+	}
+	client := NewWeChatClient(cfg)
 	s := &Server{
-		cfg:          cfg,
-		wx:           NewWeChatClient(cfg),
-		signer:       signer,
-		scans:        make(map[string]*scanSession),
-		authCodes:    make(map[string]authCode),
-		accessTokens: make(map[string]accessSession),
-		webSessions:  make(map[string]webSession),
-		usedTokens:   make(map[string]time.Time),
+		cfg:             cfg,
+		wx:              client,
+		wxMenu:          client,
+		signer:          signer,
+		management:      management,
+		wxCryptor:       cryptor,
+		scans:           make(map[string]*scanSession),
+		authCodes:       make(map[string]authCode),
+		accessTokens:    make(map[string]accessSession),
+		webSessions:     make(map[string]webSession),
+		usedTokens:      make(map[string]time.Time),
+		wechatResponses: make(map[string]wechatCachedResponse),
+		wechatInFlight:  make(map[string]chan struct{}),
 	}
 	go s.cleanupLoop()
 	return s, nil
@@ -158,6 +180,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/scan/{id}", s.handleScanStatus)
 	mux.HandleFunc("GET /wechat/callback", s.handleWeChatCallback)
 	mux.HandleFunc("POST /wechat/callback", s.handleWeChatCallback)
+	mux.HandleFunc("GET /admin/wechat", s.handleWeChatAdminPage)
+	mux.HandleFunc("GET /api/admin/wechat/state", s.handleWeChatAdminState)
+	mux.HandleFunc("PUT /api/admin/wechat/replies", s.handleWeChatAdminReplies)
+	mux.HandleFunc("PUT /api/admin/wechat/menu", s.handleWeChatAdminMenu)
+	mux.HandleFunc("POST /api/admin/wechat/menu/publish", s.handleWeChatAdminMenuPublish)
+	mux.HandleFunc("GET /api/admin/wechat/menu/remote", s.handleWeChatAdminMenuRemote)
+	mux.HandleFunc("DELETE /api/admin/wechat/menu/remote", s.handleWeChatAdminMenuDelete)
 	mux.HandleFunc("GET /api/me", s.handleAPIMe)
 	mux.HandleFunc("POST /api/logout", s.handleAPILogout)
 	mux.HandleFunc("/", s.handleHome)
@@ -373,6 +402,11 @@ func (s *Server) cleanupExpired() {
 	for key, expiresAt := range s.usedTokens {
 		if now.After(expiresAt) {
 			delete(s.usedTokens, key)
+		}
+	}
+	for key, response := range s.wechatResponses {
+		if now.After(response.ExpiresAt) {
+			delete(s.wechatResponses, key)
 		}
 	}
 }

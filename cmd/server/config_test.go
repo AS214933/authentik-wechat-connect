@@ -60,6 +60,17 @@ func TestValidateWeChatQRCodeTTL(t *testing.T) {
 	}
 }
 
+func TestValidateWeChatCallbackTimeout(t *testing.T) {
+	if err := validateWeChatCallbackTimeout(3 * time.Second); err != nil {
+		t.Fatalf("expected callback timeout to be accepted: %v", err)
+	}
+	for _, timeout := range []time.Duration{0, -time.Second, 4*time.Second + time.Nanosecond} {
+		if err := validateWeChatCallbackTimeout(timeout); err == nil {
+			t.Errorf("expected callback timeout %s to be rejected", timeout)
+		}
+	}
+}
+
 func TestValidateProductionConfigRequiresSessionSecret(t *testing.T) {
 	t.Setenv("SESSION_SECRET", "")
 	cfg := productionConfigForTest()
@@ -90,5 +101,15 @@ func TestValidateProductionConfigAllowsLocalDevelopmentDefaults(t *testing.T) {
 	cfg := Config{PublicURL: "http://localhost:8080", OIDCClientSecret: "change-me"}
 	if err := validateProductionConfig(cfg); err != nil {
 		t.Fatalf("local development defaults should be accepted: %v", err)
+	}
+}
+
+func TestValidateProductionConfigRequiresStrongWeChatAdminToken(t *testing.T) {
+	t.Setenv("SESSION_SECRET", "0123456789abcdef0123456789abcdef")
+	cfg := productionConfigForTest()
+	cfg.WeChatAdminToken = "short"
+	err := validateProductionConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "WECHAT_ADMIN_TOKEN must be at least 32 bytes") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

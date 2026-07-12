@@ -28,6 +28,9 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           server.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	errs := make(chan error, 1)
