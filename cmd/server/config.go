@@ -142,9 +142,6 @@ func validateProductionConfig(cfg Config) error {
 	if len(cfg.SessionSecret) < 32 {
 		return fmt.Errorf("SESSION_SECRET must be at least 32 bytes for non-local PUBLIC_URL %q", cfg.PublicURL)
 	}
-	if cfg.OIDCPrivateKeyFile == "" && cfg.OIDCPrivateKeyPEM == "" {
-		return fmt.Errorf("OIDC_RSA_PRIVATE_KEY_FILE or OIDC_RSA_PRIVATE_KEY_PEM must be set for non-local PUBLIC_URL %q so Authentik sees a stable JWKS/id_token signing key", cfg.PublicURL)
-	}
 	if cfg.OIDCClientSecret == "change-me" {
 		return fmt.Errorf("OIDC_CLIENT_SECRET must not use the development default for non-local PUBLIC_URL %q", cfg.PublicURL)
 	}

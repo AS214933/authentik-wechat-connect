@@ -83,16 +83,12 @@ func TestValidateProductionConfigRequiresSessionSecret(t *testing.T) {
 	}
 }
 
-func TestValidateProductionConfigRequiresStableRSAKey(t *testing.T) {
+func TestValidateProductionConfigAllowsEphemeralRSAKey(t *testing.T) {
 	t.Setenv("SESSION_SECRET", "0123456789abcdef0123456789abcdef")
 	cfg := productionConfigForTest()
 	cfg.OIDCPrivateKeyPEM = ""
-	err := validateProductionConfig(cfg)
-	if err == nil {
-		t.Fatal("expected missing OIDC RSA key to be rejected")
-	}
-	if !strings.Contains(err.Error(), "OIDC_RSA_PRIVATE_KEY_FILE or OIDC_RSA_PRIVATE_KEY_PEM must be set") {
-		t.Fatalf("unexpected error: %v", err)
+	if err := validateProductionConfig(cfg); err != nil {
+		t.Fatalf("missing OIDC RSA key should use an ephemeral key: %v", err)
 	}
 }
 

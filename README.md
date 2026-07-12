@@ -131,8 +131,8 @@ Do not set `PUBLIC_URL`, `OIDC_ISSUER`, or `OIDC_ALLOWED_REDIRECT_URIS` to an Au
 | `OIDC_CLIENT_SECRET` | Client secret used by Authentik to call this service | `change-me` |
 | `OIDC_ALLOWED_REDIRECT_URIS` | Allowed Authentik callback URLs, comma-separated | empty |
 | `OIDC_INSECURE_ALLOW_ALL_REDIRECTS` | Allow any `redirect_uri`; development only | `false` |
-| `OIDC_RSA_PRIVATE_KEY_FILE` | OIDC RS256 private key file | empty |
-| `OIDC_RSA_PRIVATE_KEY_PEM` | OIDC RS256 private key content | empty |
+| `OIDC_RSA_PRIVATE_KEY_FILE` | Optional persistent OIDC RS256 private key file | empty |
+| `OIDC_RSA_PRIVATE_KEY_PEM` | Optional persistent OIDC RS256 private key content | empty |
 | `SESSION_SECRET` | Encryption key for web sessions, authorization codes, and access tokens; required in production | generated at startup |
 | `SESSION_COOKIE_NAME` | Local web-login cookie name | `wechat_connect_session` |
 | `AUTH_CODE_TTL` | OIDC authorization-code lifetime | `10m` |
@@ -175,7 +175,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 ## Production Notes
 
 - Set a stable, random `SESSION_SECRET` in production. At least 32 bytes is recommended.
-- Set a stable `OIDC_RSA_PRIVATE_KEY_FILE` or `OIDC_RSA_PRIVATE_KEY_PEM` in production, otherwise Authentik may fail to validate `id_token` after restarts because JWKS changed.
+- Without `OIDC_RSA_PRIVATE_KEY_FILE` or `OIDC_RSA_PRIVATE_KEY_PEM`, the service generates an ephemeral signing key at startup. This is supported, but a persistent key avoids JWKS changes across restarts and replicas.
 - Non-localhost `PUBLIC_URL` rejects the default `OIDC_CLIENT_SECRET=change-me`.
 - Non-localhost deployments reject a configured `WECHAT_ADMIN_TOKEN` shorter than 32 bytes. Generate an independent random value, for example with `openssl rand -base64 32`.
 - Back up `WECHAT_MANAGEMENT_DATA_FILE`. The included Docker Compose volume persists it; a container without a volume loses it when removed.
