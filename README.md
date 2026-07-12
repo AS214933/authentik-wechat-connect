@@ -68,7 +68,9 @@ Reply rules are ordered and use the first match. They can match standard message
 
 Passive reply types are text, image, voice, video, music, news, official AI, and customer-service transfer. Media replies require a Media ID already uploaded to WeChat. Official AI emits the documented `transfer_biz_ai_ivr` message type; it only works for standard user messages when the account has WeChat AI reply enabled and its historical articles have finished training. It is distinct from `transfer_customer_service`.
 
-The menu editor saves a local draft first. **Save draft does not change WeChat.** Publish explicitly calls `/cgi-bin/menu/create`; reading the remote menu calls `/cgi-bin/get_current_selfmenu_info`; deleting calls `/cgi-bin/menu/delete`. WeChat may take about five minutes to refresh clients. Menu creation generally requires an eligible, verified account, and the AppSecret API-call IP allowlist must include this service.
+The menu editor saves a local draft first. **Save draft does not change WeChat.** Publish explicitly calls `/cgi-bin/menu/create`; reading the remote menu calls `/cgi-bin/get_current_selfmenu_info`; deleting calls `/cgi-bin/menu/delete`. The current-menu response uses a different shape from the create request (`selfmenu_info.button` and `sub_button.list`) and may contain website-only actions. Use **Import as draft** to normalize it. Website `text` actions are converted to `click` buttons plus exact managed reply rules; website `img`, `voice`, `video`, and `news` actions are rejected because their returned temporary/download fields cannot be reused as permanent API media. WeChat may take about five minutes to refresh clients.
+
+Reading and publishing have different account permissions. An account may be allowed to call `/cgi-bin/get_current_selfmenu_info` but not `/cgi-bin/menu/create`; unverified Subscription Accounts generally cannot publish API-managed menus. Publishing also requires the AppSecret API-call IP allowlist to include this service.
 
 Example menu draft:
 
@@ -188,6 +190,8 @@ docker run --rm -p 8080:8080 --env-file .env \
 
 - Authentik Federated identity providers: https://docs.goauthentik.io/users-sources/sources/social-logins/
 - WeChat Subscription Account custom menus: https://developers.weixin.qq.com/doc/subscription/guide/product/menu/intro.html
+- WeChat current custom menu response: https://developers.weixin.qq.com/doc/subscription/api/custommenu/api_getcurrentselfmenuinfo
+- WeChat custom menu creation: https://developers.weixin.qq.com/doc/subscription/api/custommenu/api_createcustommenu
 - WeChat Subscription Account standard messages: https://developers.weixin.qq.com/doc/subscription/guide/product/message/Receiving_standard_messages.html
 - WeChat event callbacks: https://developers.weixin.qq.com/doc/service/guide/product/message/Receiving_event_pushes.html
 - WeChat parameterized QR codes: https://developers.weixin.qq.com/doc/service/api/qrcode/qrcodes/api_createqrcode.html

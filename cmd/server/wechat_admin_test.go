@@ -60,7 +60,7 @@ func TestWeChatAdminPageIsPublicAndCSPProtected(t *testing.T) {
 		t.Fatalf("unexpected CSP=%q", csp)
 	}
 	body := recorder.Body.String()
-	for _, required := range []string{"sessionStorage", "If-Match", "window.confirm", "/api/admin/wechat/menu/remote", "defaultReplyType", "addRuleButton"} {
+	for _, required := range []string{"sessionStorage", "If-Match", "window.confirm", "/api/admin/wechat/menu/remote", "importRemoteButton", "defaultReplyType", "addRuleButton"} {
 		if !strings.Contains(body, required) {
 			t.Errorf("admin page missing %q", required)
 		}
@@ -291,6 +291,48 @@ func TestWeChatAdminMenuSavePublishRemoteAndDelete(t *testing.T) {
 	}
 }
 
+func TestWeChatAdminImportsWebsiteTextMenuAndPublishesCanonicalMenu(t *testing.T) {
+	server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
+	saved := performWeChatAdminTestRequest(server, http.MethodPut, "/api/admin/wechat/menu", currentWebsiteTextMenuFixture, wechatAdminTestToken, `"0"`)
+	if saved.Code != http.StatusOK || saved.Header().Get("ETag") != `"1"` {
+		t.Fatalf("save status=%d ETag=%q body=%s", saved.Code, saved.Header().Get("ETag"), saved.Body.String())
+	}
+	state := server.management.Snapshot()
+	if !state.Replies.Enabled || len(state.Replies.Rules) != 3 || len(state.Menu.Button) != 2 {
+		t.Fatalf("imported state=%#v", state)
+	}
+	firstButton := state.Menu.Button[0].SubButton[0]
+	reply, ruleID := state.Replies.SelectReply(WeChatInboundMessage{MsgType: "event", Event: "CLICK", EventKey: firstButton.Key})
+	if reply == nil || reply.Type != "text" || reply.Content != "你好，感谢关注！\n这里是公众号介绍。" || !strings.HasPrefix(ruleID, importedMenuReplyRulePrefix) {
+		t.Fatalf("click reply=%#v rule=%q", reply, ruleID)
+	}
+
+	published := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/publish", "", wechatAdminTestToken, `"1"`)
+	if published.Code != http.StatusOK || fake.publishCalls != 1 || !reflect.DeepEqual(fake.published, state.Menu) {
+		t.Fatalf("publish status=%d calls=%d menu=%#v body=%s", published.Code, fake.publishCalls, fake.published, published.Body.String())
+	}
+	payload, err := json.Marshal(fake.published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), `"type":"text"`) || strings.Contains(string(payload), `"value"`) {
+		t.Fatalf("published invalid menu payload: %s", payload)
+	}
+}
+
+func TestWeChatAdminRejectedMenuImportDoesNotChangeState(t *testing.T) {
+	server, _ := newWeChatAdminTestServer(t, wechatAdminTestToken)
+	raw := `{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"video","name":"视频","value":"https://example.com/video.mp4"}]}}`
+	recorder := performWeChatAdminTestRequest(server, http.MethodPut, "/api/admin/wechat/menu", raw, wechatAdminTestToken, `"0"`)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "button[0]") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	state := server.management.Snapshot()
+	if state.Revision != 0 || len(state.Menu.Button) != 0 || len(state.Replies.Rules) != 0 {
+		t.Fatalf("rejected import changed state=%#v", state)
+	}
+}
+
 func TestWeChatAdminMenuPublishRequiresCurrentRevision(t *testing.T) {
 	server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
 	if _, err := server.management.UpdateMenu(0, validWeChatAdminTestMenu()); err != nil {
@@ -382,6 +424,18 @@ func TestWeChatAdminMenuFailuresAreSafe(t *testing.T) {
 		fake.publishErr = &wechatMenuAPIError{Operation: "publish", Code: 40018, Message: "invalid button name size"}
 		recorder := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/publish", "", wechatAdminTestToken, `"1"`)
 		if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "40018") || !strings.Contains(recorder.Body.String(), "invalid button name size") {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+	})
+
+	t.Run("menu permission error explains read versus publish", func(t *testing.T) {
+		server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
+		if _, err := server.management.UpdateMenu(0, validWeChatAdminTestMenu()); err != nil {
+			t.Fatalf("seed menu: %v", err)
+		}
+		fake.publishErr = &wechatMenuAPIError{Operation: "publish", Code: 48001, Message: "api unauthorized"}
+		recorder := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/publish", "", wechatAdminTestToken, `"1"`)
+		if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "48001") || !strings.Contains(recorder.Body.String(), "permission to read") {
 			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 		}
 	})

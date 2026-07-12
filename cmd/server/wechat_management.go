@@ -700,6 +700,24 @@ func (s *wechatManagementStore) UpdateMenu(expectedRevision uint64, menu WeChatM
 	return s.commitLocked(candidate)
 }
 
+func (s *wechatManagementStore) UpdateMenuAndReplies(expectedRevision uint64, menu WeChatMenu, replies WeChatReplySettings) (WeChatManagementState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expectedRevision != s.state.Revision {
+		return WeChatManagementState{}, fmt.Errorf("%w: expected %d, current %d", errManagementRevisionConflict, expectedRevision, s.state.Revision)
+	}
+	candidate := cloneWeChatManagementState(s.state)
+	candidate.Menu = cloneWeChatMenu(menu)
+	candidate.Replies = cloneWeChatReplySettings(replies)
+	if err := candidate.Menu.Validate(); err != nil {
+		return WeChatManagementState{}, fmt.Errorf("validate menu: %w", err)
+	}
+	if err := validateWeChatReplySettings(&candidate.Replies); err != nil {
+		return WeChatManagementState{}, fmt.Errorf("validate replies: %w", err)
+	}
+	return s.commitLocked(candidate)
+}
+
 func (s *wechatManagementStore) commitLocked(candidate WeChatManagementState) (WeChatManagementState, error) {
 	candidate.SchemaVersion = wechatManagementSchemaVersion
 	candidate.Revision = s.state.Revision + 1

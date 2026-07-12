@@ -95,8 +95,13 @@ func (s *Server) handleWeChatAdminMenu(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var menu WeChatMenu
-	if !decodeWeChatAdminRequest(w, r, &menu) {
+	var raw json.RawMessage
+	if !decodeWeChatAdminRequest(w, r, &raw) {
+		return
+	}
+	menu, importedRules, imported, err := decodeWeChatAdminMenuPayload(raw)
+	if err != nil {
+		publicError(w, http.StatusBadRequest, fmt.Errorf("invalid menu: %w", err))
 		return
 	}
 	if err := menu.Validate(); err != nil {
@@ -108,7 +113,17 @@ func (s *Server) handleWeChatAdminMenu(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := s.management.UpdateMenu(expectedRevision, menu)
+	var state WeChatManagementState
+	if imported {
+		replies := mergeImportedMenuReplyRules(s.management.Snapshot().Replies, importedRules)
+		if err := replies.Validate(); err != nil {
+			publicError(w, http.StatusBadRequest, fmt.Errorf("invalid imported menu replies: %w", err))
+			return
+		}
+		state, err = s.management.UpdateMenuAndReplies(expectedRevision, menu, replies)
+	} else {
+		state, err = s.management.UpdateMenu(expectedRevision, menu)
+	}
 	if err != nil {
 		s.handleWeChatManagementUpdateError(w, err)
 		return
@@ -194,6 +209,9 @@ func (s *Server) writeWeChatMenuGatewayError(w http.ResponseWriter, operation st
 	var apiError *wechatMenuAPIError
 	if errors.As(err, &apiError) {
 		message := strings.Join(strings.Fields(apiError.Message), " ")
+		if apiError.Code == 48001 {
+			message += "; this account is not authorized to call menu/create; permission to read the current menu does not grant permission to publish one, and unverified Subscription Accounts generally cannot publish menus through this API"
+		}
 		if s.cfg.WeChatAdminToken != "" {
 			message = strings.ReplaceAll(message, s.cfg.WeChatAdminToken, "[REDACTED]")
 		}
@@ -521,6 +539,7 @@ const wechatAdminPageHTML = `<!doctype html>
               <div><h2>远端菜单</h2></div>
               <div class="actions">
                 <button id="readRemoteButton" class="secondary" type="button">读取远端</button>
+                <button id="importRemoteButton" class="secondary" type="button">导入为草稿</button>
                 <button id="deleteRemoteButton" class="danger" type="button">删除远端</button>
               </div>
             </div>
@@ -632,21 +651,26 @@ const wechatAdminPageHTML = `<!doctype html>
       byID("revisionBadge").textContent = "Revision " + String(revision);
     }
 
+    function applyEditableState(state) {
+      state = state || {};
+      rules = clone(state.replies && Array.isArray(state.replies.rules) ? state.replies.rules : []);
+      defaultReply = clone(state.replies ? state.replies.default_reply : null);
+      byID("replyEnabled").checked = Boolean(state.replies && state.replies.enabled);
+      byID("menuEditor").value = JSON.stringify(state.menu || { button: [] }, null, 2);
+      renderDefaultReply();
+      renderRules();
+    }
+
     async function loadState() {
       setStatus("loginStatus", "正在验证...", "pending");
       try {
         var result = await request("/api/admin/wechat/state");
         var state = result.payload || {};
         updateRevision(result);
-        rules = clone(state.replies && Array.isArray(state.replies.rules) ? state.replies.rules : []);
-        defaultReply = clone(state.replies ? state.replies.default_reply : null);
-        byID("replyEnabled").checked = Boolean(state.replies && state.replies.enabled);
-        byID("menuEditor").value = JSON.stringify(state.menu || { button: [] }, null, 2);
+        applyEditableState(state);
         byID("callbackURL").textContent = state.callback_url || "";
         byID("aesBadge").textContent = state.aes_enabled ? "AES 已启用" : "AES 未启用";
         byID("aesBadge").dataset.tone = state.aes_enabled ? "ok" : "warn";
-        renderDefaultReply();
-        renderRules();
         showWorkspace();
       } catch (error) {
         if (error.status === 401) {
@@ -906,14 +930,15 @@ const wechatAdminPageHTML = `<!doctype html>
       var menu;
       try { menu = JSON.parse(byID("menuEditor").value); }
       catch (error) { setStatus("menuStatus", "菜单 JSON 无效：" + error.message, "error"); return; }
+      if (menu && (Object.prototype.hasOwnProperty.call(menu, "is_menu_open") || Object.prototype.hasOwnProperty.call(menu, "selfmenu_info"))) {
+        if (!window.confirm("这是微信查询接口返回的菜单。导入时，官网文本按钮会转换为 click 按钮和精确回复规则。继续？")) { return; }
+      }
       runOperation(button, "menuStatus", "正在保存...", "菜单草稿已保存", async function () {
         var result = await request("/api/admin/wechat/menu", {
           method: "PUT", headers: { "If-Match": revisionETag }, body: JSON.stringify(menu)
         });
         updateRevision(result);
-        if (result.payload && result.payload.menu) {
-          byID("menuEditor").value = JSON.stringify(result.payload.menu, null, 2);
-        }
+        if (result.payload) { applyEditableState(result.payload); }
       });
     });
 
@@ -929,6 +954,21 @@ const wechatAdminPageHTML = `<!doctype html>
       runOperation(button, "remoteStatus", "正在读取...", "远端菜单已读取", async function () {
         var result = await request("/api/admin/wechat/menu/remote");
         byID("remoteOutput").textContent = result.payload ? JSON.stringify(result.payload, null, 2) : result.raw;
+      });
+    });
+
+    byID("importRemoteButton").addEventListener("click", function () {
+      if (!window.confirm("导入会覆盖已保存的菜单草稿，并替换上次导入菜单生成的文本回复规则。继续？")) { return; }
+      var button = byID("importRemoteButton");
+      runOperation(button, "remoteStatus", "正在导入...", "远端菜单已导入为草稿", async function () {
+        var remote = await request("/api/admin/wechat/menu/remote");
+        byID("remoteOutput").textContent = remote.payload ? JSON.stringify(remote.payload, null, 2) : remote.raw;
+        var body = remote.payload ? JSON.stringify(remote.payload) : remote.raw;
+        var saved = await request("/api/admin/wechat/menu", {
+          method: "PUT", headers: { "If-Match": revisionETag }, body: body
+        });
+        updateRevision(saved);
+        if (saved.payload) { applyEditableState(saved.payload); }
       });
     });
 
