@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -26,31 +27,38 @@ type Server struct {
 	management *wechatManagementStore
 	wxCryptor  *wechatCryptor
 
-	mu              sync.Mutex
-	scans           map[string]*scanSession
-	authCodes       map[string]authCode
-	accessTokens    map[string]accessSession
-	webSessions     map[string]webSession
-	usedTokens      map[string]time.Time
-	wechatResponses map[string]wechatCachedResponse
-	wechatInFlight  map[string]chan struct{}
+	mu                    sync.Mutex
+	scans                 map[string]*scanSession
+	authCodes             map[string]authCode
+	accessTokens          map[string]accessSession
+	webSessions           map[string]webSession
+	usedTokens            map[string]time.Time
+	wechatResponses       map[string]wechatCachedResponse
+	wechatInFlight        map[string]chan struct{}
+	wechatPlainSignatures map[string]wechatPlainSignatureRecord
+	loginCodes            map[string]string
+	qrUnauthorized        bool
 }
 
 type scanSession struct {
-	ID          string
-	Kind        string
-	OIDC        oidcAuthRequest
-	ReturnTo    string
-	QRImageURL  string
-	Ticket      string
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
-	CompletedAt time.Time
-	User        User
-	AuthCode    string
-	RedirectURL string
-	Error       string
-	Completing  bool
+	ID            string
+	Kind          string
+	OIDC          oidcAuthRequest
+	ReturnTo      string
+	QRImageURL    string
+	Ticket        string
+	LoginMode     string
+	LoginCode     string
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	CompletedAt   time.Time
+	User          User
+	AuthCode      string
+	RedirectURL   string
+	Error         string
+	Completing    bool
+	ClaimedOpenID string
+	LocalConsumed bool
 }
 
 type oidcAuthRequest struct {
@@ -147,19 +155,21 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	client := NewWeChatClient(cfg)
 	s := &Server{
-		cfg:             cfg,
-		wx:              client,
-		wxMenu:          client,
-		signer:          signer,
-		management:      management,
-		wxCryptor:       cryptor,
-		scans:           make(map[string]*scanSession),
-		authCodes:       make(map[string]authCode),
-		accessTokens:    make(map[string]accessSession),
-		webSessions:     make(map[string]webSession),
-		usedTokens:      make(map[string]time.Time),
-		wechatResponses: make(map[string]wechatCachedResponse),
-		wechatInFlight:  make(map[string]chan struct{}),
+		cfg:                   cfg,
+		wx:                    client,
+		wxMenu:                client,
+		signer:                signer,
+		management:            management,
+		wxCryptor:             cryptor,
+		scans:                 make(map[string]*scanSession),
+		authCodes:             make(map[string]authCode),
+		accessTokens:          make(map[string]accessSession),
+		webSessions:           make(map[string]webSession),
+		usedTokens:            make(map[string]time.Time),
+		wechatResponses:       make(map[string]wechatCachedResponse),
+		wechatInFlight:        make(map[string]chan struct{}),
+		wechatPlainSignatures: make(map[string]wechatPlainSignatureRecord),
+		loginCodes:            make(map[string]string),
 	}
 	go s.cleanupLoop()
 	return s, nil
@@ -381,6 +391,9 @@ func (s *Server) cleanupExpired() {
 	defer s.mu.Unlock()
 	for key, value := range s.scans {
 		if now.After(value.ExpiresAt.Add(time.Minute)) {
+			if value.LoginCode != "" {
+				delete(s.loginCodes, normalizeLoginCode(value.LoginCode))
+			}
 			delete(s.scans, key)
 		}
 	}
@@ -409,6 +422,11 @@ func (s *Server) cleanupExpired() {
 			delete(s.wechatResponses, key)
 		}
 	}
+	for key, record := range s.wechatPlainSignatures {
+		if now.After(record.ExpiresAt) {
+			delete(s.wechatPlainSignatures, key)
+		}
+	}
 }
 
 func randomToken(bytes int) (string, error) {
@@ -417,6 +435,29 @@ func randomToken(bytes int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func randomLoginCode() (string, error) {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf)
+	return encoded[:4] + "-" + encoded[4:8] + "-" + encoded[8:], nil
+}
+
+func normalizeLoginCode(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	value = strings.NewReplacer("-", "", " ", "", "\t", "", "\r", "", "\n", "").Replace(value)
+	if len(value) != 13 {
+		return ""
+	}
+	for _, char := range value {
+		if (char < 'A' || char > 'Z') && (char < '2' || char > '7') {
+			return ""
+		}
+	}
+	return value
 }
 
 func (s *Server) sealToken(tokenType string, ttl time.Duration, payload any) (string, time.Time, error) {

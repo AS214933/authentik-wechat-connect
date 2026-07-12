@@ -6,11 +6,13 @@ A Go middleware service that turns WeChat Official Account QR-code login into a 
 
 1. The user selects WeChat login in Authentik.
 2. Authentik redirects the browser to this service at `/oauth/authorize`.
-3. This service creates a temporary WeChat parameterized QR code and shows the scan page.
+3. For a verified Service Account, this service creates a temporary parameterized QR code and shows the scan page.
 4. The user scans the QR code in WeChat. The Official Account sends a `SCAN` or `subscribe` event to `/wechat/callback`.
 5. This service matches the QR-code scene to the original Authentik authorization request and creates an authorization code.
 6. The scan page polls until the callback arrives, shows a successful binding/login state, and redirects back to the Authentik Source callback.
 7. Authentik calls `/oauth/token` and `/oauth/userinfo` to finish login or account binding.
+
+WeChat only authorizes `qrcode/create` for verified Service Accounts. With the default `WECHAT_LOGIN_MODE=auto`, error `48001` switches this process to an Official Account message-code flow: the page displays the configured permanent account QR code and a one-time code, and the user sends `登录 <code>` to the account. The validated message callback supplies the OpenID and completes the same browser session. This extra message is necessary because an ordinary account QR code has no per-login scene.
 
 ## Endpoints
 
@@ -40,19 +42,27 @@ ${PUBLIC_URL}/wechat/callback
 
 Set the WeChat callback token to the exact same value as `WECHAT_CALLBACK_TOKEN`.
 
-- Plaintext mode verifies `signature`.
+- Plaintext mode verifies `signature`, requires a fresh timestamp, and prevents the same signature tuple from being reused with a different body. WeChat's plaintext signature does not cryptographically cover the XML body, so safe mode should be used for login deployments.
 - Compatibility and safe modes verify `msg_signature`, decrypt the callback with `WECHAT_ENCODING_AES_KEY`, validate the embedded AppID, and encrypt passive replies. Safe mode is recommended.
 - The EncodingAESKey is the 43-character value configured in the WeChat console. `WECHAT_APP_ID` must also be set when AES is enabled.
 
 Enabling server push disables the automatic replies and custom menus configured on the WeChat website. Configure replacements through this service before enabling push. The website has no API that can write those old rules, so this service stores its own managed rules.
 
-The service uses temporary parameterized QR codes:
+For verified Service Accounts, the service uses temporary parameterized QR codes:
 
 - If the user already follows the account, WeChat sends `Event=SCAN` and `EventKey=<scene>`.
 - If the user follows the account after scanning, WeChat sends `Event=subscribe` and `EventKey=qrscene_<scene>`.
 - WeChat does not send a separate `start` field. The parameter analogous to a start parameter is the QR-code `scene`.
 - Login scenes use the `login:<random-session-id>` namespace. A menu click is a separate `Event=CLICK` with `EventKey=<button key>` and can never complete a login scan.
 - `FromUserName` is used as the user's Official Account OpenID. If the user-info API is available, the service also adds nickname, avatar, UnionID, and profile claims.
+
+`WECHAT_LOGIN_MODE` controls the login method:
+
+- `auto` tries the parameterized QR API and falls back to a one-time message code only when WeChat returns `48001` (`api unauthorized`). The unsupported capability is cached until the process restarts.
+- `parameter_qr` requires a verified Service Account and never falls back.
+- `message_code` skips the restricted QR API and always uses the ordinary Official Account message flow.
+
+For `auto` fallback or `message_code`, set `WECHAT_ACCOUNT_QR_CODE_URL` to an absolute HTTP(S) URL containing the permanent QR image downloaded from the Official Account console. It must use HTTPS when `PUBLIC_URL` does. `WECHAT_ACCOUNT_NAME` is optional display text. Without an image URL, the login page still shows the one-time code and asks the user to enter the configured account manually. Codes contain 64 random bits, expire with `WECHAT_QR_CODE_TTL`, are consumed once, and only callbacks accepted by the configured plaintext/AES transport validation can use them. A bare `subscribe` event or a menu `CLICK` never guesses or completes a message-code session.
 
 ## Replies And Menu Management
 
@@ -123,6 +133,9 @@ Do not set `PUBLIC_URL`, `OIDC_ISSUER`, or `OIDC_ALLOWED_REDIRECT_URIS` to an Au
 | `WECHAT_APP_SECRET` | WeChat Official Account AppSecret | empty |
 | `WECHAT_CALLBACK_TOKEN` | WeChat server callback token | empty |
 | `WECHAT_ENCODING_AES_KEY` | 43-character callback EncodingAESKey; enables compatibility/safe mode | empty |
+| `WECHAT_LOGIN_MODE` | `auto`, `parameter_qr`, or `message_code` | `auto` |
+| `WECHAT_ACCOUNT_NAME` | Account name shown by the message-code login page | empty |
+| `WECHAT_ACCOUNT_QR_CODE_URL` | Absolute HTTP(S) URL of the permanent account QR image used by message-code login | empty |
 | `WECHAT_QR_CODE_TTL` | Temporary QR-code lifetime, maximum 30 days | `5m` |
 | `WECHAT_USER_INFO_LANG` | WeChat user-info language | `zh_CN` |
 | `WECHAT_CALLBACK_TIMEOUT` | Maximum user-profile lookup time inside the 5-second callback window; maximum 4 seconds | `3s` |

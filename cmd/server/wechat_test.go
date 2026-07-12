@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -98,6 +99,28 @@ func TestWeChatClientCreatesQRCodeAndFetchesUser(t *testing.T) {
 	}
 	if user.OpenID != "openid-123" || user.UnionID != "union-123" || user.Gender != "male" {
 		t.Fatalf("unexpected user: %#v", user)
+	}
+}
+
+func TestWeChatClientReturnsTypedQRCodeAPIError(t *testing.T) {
+	client := NewWeChatClient(testConfig())
+	client.tokenEndpoint = "https://wechat.test/token"
+	client.qrCodeEndpoint = "https://wechat.test/qrcode"
+	client.httpClient = &http.Client{Transport: wechatRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/token":
+			return wechatJSONResponse(`{"access_token":"wx-token","expires_in":7200}`), nil
+		case "/qrcode":
+			return wechatJSONResponse(`{"errcode":48001,"errmsg":"api unauthorized rid: test"}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected request path %q", r.URL.Path)
+		}
+	})}
+
+	_, err := client.CreateLoginQRCode(context.Background(), "scan-unauthorized", 5*time.Minute)
+	var apiError *wechatQRCodeAPIError
+	if !errors.As(err, &apiError) || apiError.Code != 48001 || !strings.Contains(apiError.Message, "rid: test") {
+		t.Fatalf("unexpected QR error: %#v", err)
 	}
 }
 

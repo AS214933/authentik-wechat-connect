@@ -71,6 +71,30 @@ func TestValidateWeChatCallbackTimeout(t *testing.T) {
 	}
 }
 
+func TestValidateWeChatLoginMode(t *testing.T) {
+	for _, mode := range []string{wechatLoginModeAuto, wechatLoginModeParameterizedQR, wechatLoginModeMessageCode} {
+		if err := validateWeChatLoginMode(mode); err != nil {
+			t.Errorf("mode %q should be valid: %v", mode, err)
+		}
+	}
+	if err := validateWeChatLoginMode("unknown"); err == nil {
+		t.Fatal("unknown login mode should be rejected")
+	}
+}
+
+func TestValidateWeChatAccountQRCodeURL(t *testing.T) {
+	for _, rawURL := range []string{"", "https://static.example.com/account.png", "http://localhost:8081/account.png"} {
+		if err := validateWeChatAccountQRCodeURL(rawURL); err != nil {
+			t.Errorf("URL %q should be valid: %v", rawURL, err)
+		}
+	}
+	for _, rawURL := range []string{"/account.png", "javascript:alert(1)", "https://user:pass@example.com/account.png"} {
+		if err := validateWeChatAccountQRCodeURL(rawURL); err == nil {
+			t.Errorf("URL %q should be rejected", rawURL)
+		}
+	}
+}
+
 func TestValidateProductionConfigRequiresSessionSecret(t *testing.T) {
 	t.Setenv("SESSION_SECRET", "")
 	cfg := productionConfigForTest()
@@ -80,6 +104,16 @@ func TestValidateProductionConfigRequiresSessionSecret(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "SESSION_SECRET must be set") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateProductionConfigRejectsMixedContentAccountQRCode(t *testing.T) {
+	t.Setenv("SESSION_SECRET", "0123456789abcdef0123456789abcdef")
+	cfg := productionConfigForTest()
+	cfg.WeChatAccountQRCodeURL = "http://static.example.com/account.png"
+	err := validateProductionConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "must use HTTPS") {
+		t.Fatalf("unexpected mixed-content validation result: %v", err)
 	}
 }
 

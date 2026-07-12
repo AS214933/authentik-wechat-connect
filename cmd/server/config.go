@@ -20,6 +20,9 @@ type Config struct {
 	WeChatAppSecret          string
 	WeChatCallbackToken      string
 	WeChatEncodingAESKey     string
+	WeChatLoginMode          string
+	WeChatAccountName        string
+	WeChatAccountQRCodeURL   string
 	WeChatQRCodeTTL          time.Duration
 	WeChatUserInfoLang       string
 	WeChatCallbackTimeout    time.Duration
@@ -44,6 +47,12 @@ type Config struct {
 
 const maxWeChatTemporaryQRCodeTTL = 30 * 24 * time.Hour
 
+const (
+	wechatLoginModeAuto            = "auto"
+	wechatLoginModeParameterizedQR = "parameter_qr"
+	wechatLoginModeMessageCode     = "message_code"
+)
+
 func loadConfig() (Config, error) {
 	publicURL := strings.TrimRight(env("PUBLIC_URL", "http://localhost:8080"), "/")
 	if err := validateServiceURL("PUBLIC_URL", publicURL); err != nil {
@@ -66,6 +75,14 @@ func loadConfig() (Config, error) {
 	if err := validateWeChatCallbackTimeout(callbackTimeout); err != nil {
 		return Config{}, err
 	}
+	loginMode := strings.ToLower(env("WECHAT_LOGIN_MODE", wechatLoginModeAuto))
+	if err := validateWeChatLoginMode(loginMode); err != nil {
+		return Config{}, err
+	}
+	accountQRCodeURL := strings.TrimSpace(os.Getenv("WECHAT_ACCOUNT_QR_CODE_URL"))
+	if err := validateWeChatAccountQRCodeURL(accountQRCodeURL); err != nil {
+		return Config{}, err
+	}
 
 	sessionSecret := []byte(os.Getenv("SESSION_SECRET"))
 	if len(sessionSecret) == 0 {
@@ -86,6 +103,9 @@ func loadConfig() (Config, error) {
 		WeChatAppSecret:          os.Getenv("WECHAT_APP_SECRET"),
 		WeChatCallbackToken:      os.Getenv("WECHAT_CALLBACK_TOKEN"),
 		WeChatEncodingAESKey:     strings.TrimSpace(os.Getenv("WECHAT_ENCODING_AES_KEY")),
+		WeChatLoginMode:          loginMode,
+		WeChatAccountName:        strings.TrimSpace(os.Getenv("WECHAT_ACCOUNT_NAME")),
+		WeChatAccountQRCodeURL:   accountQRCodeURL,
 		WeChatQRCodeTTL:          qrTTL,
 		WeChatUserInfoLang:       env("WECHAT_USER_INFO_LANG", "zh_CN"),
 		WeChatCallbackTimeout:    callbackTimeout,
@@ -130,6 +150,9 @@ func loadConfig() (Config, error) {
 }
 
 func validateProductionConfig(cfg Config) error {
+	if strings.HasPrefix(strings.ToLower(cfg.PublicURL), "https://") && strings.HasPrefix(strings.ToLower(cfg.WeChatAccountQRCodeURL), "http://") {
+		return fmt.Errorf("WECHAT_ACCOUNT_QR_CODE_URL must use HTTPS when PUBLIC_URL uses HTTPS so browsers do not block the QR image as mixed content")
+	}
 	if isLocalServiceURL(cfg.PublicURL) {
 		return nil
 	}
@@ -200,6 +223,32 @@ func validateWeChatQRCodeTTL(ttl time.Duration) error {
 func validateWeChatCallbackTimeout(timeout time.Duration) error {
 	if timeout <= 0 || timeout > 4*time.Second {
 		return fmt.Errorf("WECHAT_CALLBACK_TIMEOUT must be greater than zero and no more than 4s")
+	}
+	return nil
+}
+
+func validateWeChatLoginMode(mode string) error {
+	switch mode {
+	case wechatLoginModeAuto, wechatLoginModeParameterizedQR, wechatLoginModeMessageCode:
+		return nil
+	default:
+		return fmt.Errorf("WECHAT_LOGIN_MODE must be one of %q, %q, or %q", wechatLoginModeAuto, wechatLoginModeParameterizedQR, wechatLoginModeMessageCode)
+	}
+}
+
+func validateWeChatAccountQRCodeURL(rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	parsed, err := url.ParseRequestURI(rawURL)
+	if err != nil || !parsed.IsAbs() {
+		if err == nil {
+			err = fmt.Errorf("URL is not absolute")
+		}
+		return fmt.Errorf("WECHAT_ACCOUNT_QR_CODE_URL must be an absolute HTTP(S) URL: %w", err)
+	}
+	if (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.User != nil {
+		return fmt.Errorf("WECHAT_ACCOUNT_QR_CODE_URL must be an absolute HTTP(S) URL without credentials")
 	}
 	return nil
 }

@@ -265,6 +265,28 @@ func TestWeChatAESCallbackDecryptsAndEncryptsManagedReply(t *testing.T) {
 	}
 }
 
+func TestWeChatAESMessageCodeCompletesLogin(t *testing.T) {
+	cfg := testConfig()
+	cfg.WeChatEncodingAESKey = testWeChatEncodingAESKey()
+	cfg.WeChatLoginMode = wechatLoginModeMessageCode
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("new encrypted server: %v", err)
+	}
+	server.wx = fakeWeChatService{}
+	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
+	if err != nil {
+		t.Fatalf("create message-code scan: %v", err)
+	}
+	body := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>aes-login-user</FromUserName><CreateTime>1720000009</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>10009</MsgId></xml>`, scan.LoginCode)
+	recorder := performEncryptedWeChatCallback(t, server, body, "1720000009", "login-nonce")
+	assertEncryptedWeChatTextReply(t, server, recorder, "登录已确认，请返回浏览器继续。")
+	completed, ok := server.scanSnapshot(scan.ID)
+	if !ok || completed.User.OpenID != "aes-login-user" || completed.RedirectURL == "" {
+		t.Fatalf("AES message code did not complete login: %#v ok=%t", completed, ok)
+	}
+}
+
 func TestWeChatResponseCacheSeparatesPlaintextAndAESModes(t *testing.T) {
 	cfg := testConfig()
 	cfg.WeChatEncodingAESKey = testWeChatEncodingAESKey()
@@ -379,6 +401,95 @@ func TestConcurrentDuplicateWeChatEventIsProcessedOnce(t *testing.T) {
 		if recorder.Code != http.StatusOK || recorder.Body.String() != "success" {
 			t.Errorf("response[%d] status=%d body=%q", i, recorder.Code, recorder.Body.String())
 		}
+	}
+}
+
+func TestConcurrentMessageCodeCallbacksConsumeLoginOnce(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeMessageCode
+	server.wx = fakeWeChatService{}
+	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
+	if err != nil {
+		t.Fatalf("create message-code scan: %v", err)
+	}
+	bodies := []string{
+		fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>message-user-a</FromUserName><CreateTime>1720000030</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>1030</MsgId></xml>`, scan.LoginCode),
+		fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>message-user-b</FromUserName><CreateTime>1720000031</CreateTime><MsgType>text</MsgType><Content>LOGIN %s</Content><MsgId>1031</MsgId></xml>`, strings.ReplaceAll(scan.LoginCode, "-", "")),
+	}
+	start := make(chan struct{})
+	recorders := make([]*httptest.ResponseRecorder, len(bodies))
+	var wait sync.WaitGroup
+	for i := range bodies {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			recorders[index] = performSignedWeChatCallback(t, server, bodies[index])
+		}(i)
+	}
+	close(start)
+	wait.Wait()
+
+	confirmedReplies := 0
+	for i, recorder := range recorders {
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("callback[%d] status=%d body=%s", i, recorder.Code, recorder.Body.String())
+		}
+		if strings.Contains(recorder.Body.String(), "登录已确认") {
+			confirmedReplies++
+		}
+	}
+	if confirmedReplies != 1 {
+		t.Fatalf("confirmed replies=%d want 1", confirmedReplies)
+	}
+	completed, ok := server.scanSnapshot(scan.ID)
+	if !ok || (completed.User.OpenID != "message-user-a" && completed.User.OpenID != "message-user-b") {
+		t.Fatalf("message-code scan was not completed exactly once: %#v ok=%t", completed, ok)
+	}
+	if _, exists := server.loginCodes[normalizeLoginCode(scan.LoginCode)]; exists {
+		t.Fatal("login code remained usable after completion")
+	}
+	firstComplete := httptest.NewRecorder()
+	server.Routes().ServeHTTP(firstComplete, httptest.NewRequest(http.MethodGet, completed.RedirectURL, nil))
+	if firstComplete.Code != http.StatusFound || len(firstComplete.Result().Cookies()) == 0 {
+		t.Fatalf("first local completion status=%d cookies=%d body=%s", firstComplete.Code, len(firstComplete.Result().Cookies()), firstComplete.Body.String())
+	}
+	secondComplete := httptest.NewRecorder()
+	server.Routes().ServeHTTP(secondComplete, httptest.NewRequest(http.MethodGet, completed.RedirectURL, nil))
+	if secondComplete.Code != http.StatusBadRequest || len(secondComplete.Result().Cookies()) != 0 {
+		t.Fatalf("replayed local completion status=%d cookies=%d body=%s", secondComplete.Code, len(secondComplete.Result().Cookies()), secondComplete.Body.String())
+	}
+}
+
+func TestPlaintextSignatureCannotBeReusedWithForgedLoginBody(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeMessageCode
+	server.wx = fakeWeChatService{}
+	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
+	if err != nil {
+		t.Fatalf("create message-code scan: %v", err)
+	}
+	timestamp := fmt.Sprint(time.Now().Unix())
+	nonce := "captured-plaintext-nonce"
+	signature := testWeChatSignature(server.cfg.WeChatCallbackToken, timestamp, nonce)
+	target := "/wechat/callback?signature=" + signature + "&timestamp=" + timestamp + "&nonce=" + nonce
+
+	originalBody := `<xml><ToUserName>official</ToUserName><FromUserName>ordinary-user</FromUserName><CreateTime>1720000040</CreateTime><MsgType>text</MsgType><Content>普通消息</Content><MsgId>1040</MsgId></xml>`
+	original := httptest.NewRecorder()
+	server.Routes().ServeHTTP(original, httptest.NewRequest(http.MethodPost, target, strings.NewReader(originalBody)))
+	if original.Code != http.StatusOK {
+		t.Fatalf("original callback status=%d body=%s", original.Code, original.Body.String())
+	}
+
+	forgedBody := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>forged-openid</FromUserName><CreateTime>1720000041</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>1041</MsgId></xml>`, scan.LoginCode)
+	forged := httptest.NewRecorder()
+	server.Routes().ServeHTTP(forged, httptest.NewRequest(http.MethodPost, target, strings.NewReader(forgedBody)))
+	if forged.Code != http.StatusForbidden {
+		t.Fatalf("forged callback status=%d body=%s", forged.Code, forged.Body.String())
+	}
+	pending, ok := server.scanSnapshot(scan.ID)
+	if !ok || pending.User.OpenID != "" || pending.ClaimedOpenID != "" {
+		t.Fatalf("forged body changed login session: %#v ok=%t", pending, ok)
 	}
 }
 

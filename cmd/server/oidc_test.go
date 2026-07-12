@@ -4,20 +4,26 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type fakeWeChatService struct {
-	user User
+	user  User
+	qrErr error
 }
 
 func (f fakeWeChatService) CreateLoginQRCode(_ context.Context, scene string, ttl time.Duration) (WeChatQRCode, error) {
+	if f.qrErr != nil {
+		return WeChatQRCode{}, f.qrErr
+	}
 	return WeChatQRCode{
 		Ticket:      "ticket-" + scene,
 		ImageURL:    "https://mp.weixin.qq.com/cgi-bin/showqrcode?ticket=ticket-" + url.QueryEscape(scene),
@@ -116,6 +122,78 @@ func TestAuthorizeRedirectsToScanPage(t *testing.T) {
 	}
 	if scan.OIDC.State != "ak-state" || scan.OIDC.Nonce != "nonce" {
 		t.Fatalf("unexpected OIDC request: %#v", scan.OIDC)
+	}
+}
+
+func TestAuthorizeFallsBackToOfficialAccountMessageCodeOnQRCode48001(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeAuto
+	server.cfg.WeChatAccountName = "测试公众号"
+	server.cfg.WeChatAccountQRCodeURL = "https://static.example.com/official-account.png"
+	server.wx = fakeWeChatService{
+		user:  User{OpenID: "openid-message", Nickname: "口令用户"},
+		qrErr: &wechatQRCodeAPIError{Code: 48001, Message: "api unauthorized rid: test"},
+	}
+
+	authorizeRec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(authorizeRec, httptest.NewRequest(http.MethodGet, authorizePath(), nil))
+	if authorizeRec.Code != http.StatusFound || !strings.HasPrefix(authorizeRec.Header().Get("Location"), "/scan/") {
+		t.Fatalf("authorize status=%d location=%q body=%s", authorizeRec.Code, authorizeRec.Header().Get("Location"), authorizeRec.Body.String())
+	}
+	scanID := strings.TrimPrefix(authorizeRec.Header().Get("Location"), "/scan/")
+	scan, ok := server.scanSnapshot(scanID)
+	if !ok || scan.LoginMode != wechatLoginModeMessageCode || normalizeLoginCode(scan.LoginCode) == "" {
+		t.Fatalf("unexpected fallback scan: %#v ok=%t", scan, ok)
+	}
+	if scan.QRImageURL != server.cfg.WeChatAccountQRCodeURL || !server.parameterizedQRUnavailable() {
+		t.Fatalf("fallback QR/capability state was not retained: %#v", scan)
+	}
+
+	pageRec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(pageRec, httptest.NewRequest(http.MethodGet, "/scan/"+scanID, nil))
+	if pageRec.Code != http.StatusOK || !strings.Contains(pageRec.Body.String(), "登录 "+scan.LoginCode) || !strings.Contains(pageRec.Body.String(), "测试公众号") {
+		t.Fatalf("fallback page status=%d body=%s", pageRec.Code, pageRec.Body.String())
+	}
+	if !strings.Contains(pageRec.Body.String(), `const scanID = "`+scanID+`";`) || !strings.Contains(pageRec.Body.String(), `clipboard.writeText("登录 `+scan.LoginCode+`")`) {
+		t.Fatalf("fallback page encoded JavaScript values incorrectly: %s", pageRec.Body.String())
+	}
+
+	// A SCAN event must not complete a message-code session, even if it carries the session ID.
+	scanBody := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>wrong-openid</FromUserName><CreateTime>1720000090</CreateTime><MsgType>event</MsgType><Event>SCAN</Event><EventKey>%s%s</EventKey></xml>`, wechatLoginScenePrefix, scanID)
+	scanRec := performSignedWeChatCallback(t, server, scanBody)
+	if scanRec.Code != http.StatusOK {
+		t.Fatalf("SCAN callback status=%d body=%s", scanRec.Code, scanRec.Body.String())
+	}
+	if pending, _ := server.scanSnapshot(scanID); pending.User.OpenID != "" {
+		t.Fatalf("SCAN incorrectly completed message-code session: %#v", pending)
+	}
+
+	messageBody := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>openid-message</FromUserName><CreateTime>1720000091</CreateTime><MsgType>text</MsgType><Content>登录 %s</Content><MsgId>9001</MsgId></xml>`, scan.LoginCode)
+	messageRec := performSignedWeChatCallback(t, server, messageBody)
+	if messageRec.Code != http.StatusOK || !strings.Contains(messageRec.Body.String(), "登录已确认") {
+		t.Fatalf("message callback status=%d body=%s", messageRec.Code, messageRec.Body.String())
+	}
+	completed, ok := server.scanSnapshot(scanID)
+	if !ok || completed.User.OpenID != "openid-message" || completed.RedirectURL == "" {
+		t.Fatalf("message code did not complete OIDC scan: %#v ok=%t", completed, ok)
+	}
+	if _, exists := server.loginCodes[normalizeLoginCode(scan.LoginCode)]; exists {
+		t.Fatal("completed login code was not consumed")
+	}
+}
+
+func TestParameterizedQRCodeModeDoesNotHide48001(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeParameterizedQR
+	server.wx = fakeWeChatService{qrErr: &wechatQRCodeAPIError{Code: 48001, Message: "api unauthorized"}}
+
+	_, err := server.createScanSession(context.Background(), scanKindOIDC, oidcAuthRequest{}, "")
+	var apiError *wechatQRCodeAPIError
+	if !errors.As(err, &apiError) || apiError.Code != 48001 {
+		t.Fatalf("parameter_qr mode should retain typed 48001, got %v", err)
+	}
+	if len(server.scans) != 0 || server.parameterizedQRUnavailable() {
+		t.Fatalf("parameter_qr mode unexpectedly created fallback state: scans=%d unavailable=%t", len(server.scans), server.parameterizedQRUnavailable())
 	}
 }
 
@@ -245,8 +323,8 @@ func authorizePath() string {
 }
 
 func signedWeChatRequest(server *Server, method, target string, body *strings.Reader) *http.Request {
-	timestamp := "1720000000"
-	nonce := "nonce"
+	timestamp := fmt.Sprint(time.Now().Unix())
+	nonce := fmt.Sprintf("nonce-%d", signedWeChatRequestCounter.Add(1))
 	signature := testWeChatSignature(server.cfg.WeChatCallbackToken, timestamp, nonce)
 	separator := "?"
 	if strings.Contains(target, "?") {
@@ -254,3 +332,5 @@ func signedWeChatRequest(server *Server, method, target string, body *strings.Re
 	}
 	return httptest.NewRequest(method, target+separator+"signature="+signature+"&timestamp="+timestamp+"&nonce="+nonce, body)
 }
+
+var signedWeChatRequestCounter atomic.Uint64

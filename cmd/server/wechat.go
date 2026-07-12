@@ -69,6 +69,15 @@ type wechatQRCodeResponse struct {
 	ErrMsg        string `json:"errmsg"`
 }
 
+type wechatQRCodeAPIError struct {
+	Code    int
+	Message string
+}
+
+func (e *wechatQRCodeAPIError) Error() string {
+	return fmt.Sprintf("WeChat QR code error %d: %s", e.Code, e.Message)
+}
+
 type wechatUserInfoResponse struct {
 	Subscribe  int    `json:"subscribe"`
 	OpenID     string `json:"openid"`
@@ -136,7 +145,7 @@ func (c *WeChatClient) CreateLoginQRCode(ctx context.Context, scene string, ttl 
 		return WeChatQRCode{}, fmt.Errorf("decode WeChat QR code response: %w", err)
 	}
 	if result.ErrCode != 0 {
-		return WeChatQRCode{}, fmt.Errorf("WeChat QR code error %d: %s", result.ErrCode, result.ErrMsg)
+		return WeChatQRCode{}, &wechatQRCodeAPIError{Code: result.ErrCode, Message: result.ErrMsg}
 	}
 	if result.Ticket == "" {
 		return WeChatQRCode{}, fmt.Errorf("WeChat QR code response did not include ticket")

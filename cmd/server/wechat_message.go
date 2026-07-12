@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -11,20 +12,28 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	maxWeChatCallbackBody         = 1 << 20
-	wechatResponseCacheTTL        = 10 * time.Minute
-	wechatResponseCacheMaxEntries = 10000
+	maxWeChatCallbackBody          = 1 << 20
+	wechatResponseCacheTTL         = 10 * time.Minute
+	wechatResponseCacheMaxEntries  = 10000
+	wechatPlainSignatureTTL        = 10 * time.Minute
+	wechatPlainSignatureMaxEntries = 10000
 )
 
 type wechatCachedResponse struct {
 	ContentType string
 	Body        []byte
 	ExpiresAt   time.Time
+}
+
+type wechatPlainSignatureRecord struct {
+	BodyHash  [sha256.Size]byte
+	ExpiresAt time.Time
 }
 
 type wechatEncryptedEnvelope struct {
@@ -142,10 +151,17 @@ func (s *Server) handleWeChatCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-	} else if !verifyWeChatSignature(s.cfg.WeChatCallbackToken, query.Get("timestamp"), query.Get("nonce"), query.Get("signature")) {
-		logOAuthWarning(r, "wechat callback rejected: signature verification failed")
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
+	} else {
+		if !verifyWeChatSignature(s.cfg.WeChatCallbackToken, query.Get("timestamp"), query.Get("nonce"), query.Get("signature")) {
+			logOAuthWarning(r, "wechat callback rejected: signature verification failed")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !s.acceptWeChatPlainSignature(query.Get("signature"), query.Get("timestamp"), query.Get("nonce"), body, time.Now()) {
+			logOAuthWarning(r, "wechat callback rejected: plaintext signature is stale or was reused with a different body")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	var message WeChatInboundMessage
@@ -189,9 +205,13 @@ func (s *Server) handleWeChatCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.abortWeChatResponse(cacheKey)
 
-	s.processWeChatScanEvent(r, message)
+	completedByMessageCode := s.processWeChatLogin(r, message)
 	state := s.management.Snapshot()
 	reply, ruleID := state.Replies.SelectReply(message)
+	if completedByMessageCode {
+		reply = &WeChatReply{Type: "text", Content: "登录已确认，请返回浏览器继续。"}
+		ruleID = "wechat-login-code"
+	}
 	responseBody := []byte("success")
 	contentType := "text/plain; charset=utf-8"
 	if reply != nil {
@@ -244,10 +264,10 @@ func (s *Server) handleWeChatCallbackVerification(w http.ResponseWriter, r *http
 	_, _ = w.Write([]byte(echo))
 }
 
-func (s *Server) processWeChatScanEvent(r *http.Request, message WeChatInboundMessage) {
-	scene, ok := sceneFromWeChatEvent(message)
-	if !ok || !strings.HasPrefix(scene, wechatLoginScenePrefix) {
-		return
+func (s *Server) processWeChatLogin(r *http.Request, message WeChatInboundMessage) bool {
+	scene, messageCode, ok := s.pendingLoginScene(message)
+	if !ok {
+		return false
 	}
 	user := User{OpenID: message.FromUserName}
 	timeout := s.cfg.WeChatCallbackTimeout
@@ -257,15 +277,69 @@ func (s *Server) processWeChatScanEvent(r *http.Request, message WeChatInboundMe
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 	if fetched, err := s.wx.FetchUser(ctx, message.FromUserName); err == nil {
-		user = fetched
+		if fetched.OpenID == message.FromUserName {
+			user = fetched
+		} else {
+			log.Printf("wechat user info lookup returned a mismatched OpenID requested_fp=%s returned_fp=%s", tokenFingerprint(message.FromUserName), tokenFingerprint(fetched.OpenID))
+		}
 	} else {
 		log.Printf("wechat user info lookup failed openid_fp=%s: %v", tokenFingerprint(message.FromUserName), err)
 	}
-	if err := s.completeScan(r, scene, user); err != nil {
+	completed, err := s.completeScan(r, scene, user)
+	if err != nil {
 		logOAuthWarning(r, "wechat callback scan completion ignored scene_fp=%s openid_fp=%s: %v", tokenFingerprint(scene), tokenFingerprint(message.FromUserName), err)
-	} else {
+	} else if completed {
 		logOAuthInfo(r, "wechat callback completed scan scene_fp=%s openid_fp=%s", tokenFingerprint(scene), tokenFingerprint(message.FromUserName))
 	}
+	return messageCode && completed
+}
+
+func (s *Server) pendingLoginScene(message WeChatInboundMessage) (string, bool, bool) {
+	if scene, ok := sceneFromWeChatEvent(message); ok && strings.HasPrefix(scene, wechatLoginScenePrefix) {
+		id := strings.TrimPrefix(scene, wechatLoginScenePrefix)
+		s.mu.Lock()
+		scan, exists := s.scans[id]
+		accepted := exists && scan.LoginMode != wechatLoginModeMessageCode && scan.User.OpenID == "" && scan.Error == "" && time.Now().Before(scan.ExpiresAt)
+		s.mu.Unlock()
+		if accepted {
+			return scene, false, true
+		}
+	}
+	code, ok := loginCodeFromWeChatText(message)
+	if !ok {
+		return "", false, false
+	}
+	s.mu.Lock()
+	id, exists := s.loginCodes[code]
+	scan := s.scans[id]
+	accepted := exists && scan != nil && scan.LoginMode == wechatLoginModeMessageCode && scan.User.OpenID == "" && scan.Error == "" && time.Now().Before(scan.ExpiresAt)
+	if accepted {
+		scan.ClaimedOpenID = message.FromUserName
+		delete(s.loginCodes, code)
+	}
+	s.mu.Unlock()
+	if !accepted {
+		return "", false, false
+	}
+	return wechatLoginScenePrefix + id, true, true
+}
+
+func loginCodeFromWeChatText(message WeChatInboundMessage) (string, bool) {
+	if !strings.EqualFold(message.MsgType, "text") {
+		return "", false
+	}
+	content := strings.TrimSpace(message.Content)
+	var rawCode string
+	switch {
+	case strings.HasPrefix(content, "登录"):
+		rawCode = strings.TrimSpace(strings.TrimPrefix(content, "登录"))
+	case len(content) >= len("login") && strings.EqualFold(content[:len("login")], "login"):
+		rawCode = strings.TrimSpace(content[len("login"):])
+	default:
+		return "", false
+	}
+	code := normalizeLoginCode(rawCode)
+	return code, code != ""
 }
 
 func renderWeChatPassiveReply(message WeChatInboundMessage, reply WeChatReply, now time.Time) ([]byte, error) {
@@ -348,6 +422,39 @@ func verifyWeChatSignature(token, timestamp, nonce, signature string) bool {
 	}
 	expected := calculateWeChatMessageSignature(token, timestamp, nonce)
 	return hmac.Equal([]byte(expected), []byte(strings.ToLower(signature)))
+}
+
+func (s *Server) acceptWeChatPlainSignature(signature, timestamp, nonce string, body []byte, now time.Time) bool {
+	unixTimestamp, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	signedAt := time.Unix(unixTimestamp, 0)
+	if signedAt.Before(now.Add(-wechatPlainSignatureTTL)) || signedAt.After(now.Add(wechatPlainSignatureTTL)) {
+		return false
+	}
+	key := signature + "\x00" + timestamp + "\x00" + nonce
+	bodyHash := sha256.Sum256(body)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wechatPlainSignatures == nil {
+		s.wechatPlainSignatures = make(map[string]wechatPlainSignatureRecord)
+	}
+	if previous, exists := s.wechatPlainSignatures[key]; exists && now.Before(previous.ExpiresAt) {
+		return previous.BodyHash == bodyHash
+	}
+	if len(s.wechatPlainSignatures) >= wechatPlainSignatureMaxEntries {
+		for candidate := range s.wechatPlainSignatures {
+			delete(s.wechatPlainSignatures, candidate)
+			break
+		}
+	}
+	s.wechatPlainSignatures[key] = wechatPlainSignatureRecord{
+		BodyHash:  bodyHash,
+		ExpiresAt: signedAt.Add(wechatPlainSignatureTTL),
+	}
+	return true
 }
 
 func sceneFromWeChatEvent(message WeChatInboundMessage) (string, bool) {
