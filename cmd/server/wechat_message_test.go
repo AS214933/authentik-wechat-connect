@@ -169,6 +169,57 @@ func TestWeChatTextCallbackUsesManagedReplyAndReplaysDuplicate(t *testing.T) {
 	}
 }
 
+func TestImportedMenuKeywordUsesTextCallbackNotClickEvent(t *testing.T) {
+	server := testServer(t)
+	rules, err := decodeWeChatWebsiteMenuKeywordRules([]byte(currentWebsiteTextMenuFixture))
+	if err != nil {
+		t.Fatalf("decode menu keywords: %v", err)
+	}
+	if _, err := server.management.UpdateReplies(0, WeChatReplySettings{Enabled: true, Rules: rules}); err != nil {
+		t.Fatalf("save keyword replies: %v", err)
+	}
+	textBody := `<xml><ToUserName>official</ToUserName><FromUserName>keyword-user</FromUserName><CreateTime>1720000012</CreateTime><MsgType>text</MsgType><Content>关于此公众号</Content><MsgId>10012</MsgId></xml>`
+	textReply := performSignedWeChatCallback(t, server, textBody)
+	if textReply.Code != http.StatusOK || textReply.Header().Get("Content-Type") != "application/xml; charset=utf-8" {
+		t.Fatalf("text status=%d type=%q body=%s", textReply.Code, textReply.Header().Get("Content-Type"), textReply.Body.String())
+	}
+	var decoded wechatPassiveReplyXML
+	if err := xml.Unmarshal(textReply.Body.Bytes(), &decoded); err != nil || decoded.Content != "你好，感谢关注！\n这里是公众号介绍。" {
+		t.Fatalf("text reply=%#v err=%v body=%s", decoded, err, textReply.Body.String())
+	}
+
+	clickBody := `<xml><ToUserName>official</ToUserName><FromUserName>keyword-user</FromUserName><CreateTime>1720000013</CreateTime><MsgType>event</MsgType><Event>CLICK</Event><EventKey>关于此公众号</EventKey></xml>`
+	clickReply := performSignedWeChatCallback(t, server, clickBody)
+	if clickReply.Code != http.StatusOK || clickReply.Body.String() != "success" {
+		t.Fatalf("CLICK status=%d body=%q", clickReply.Code, clickReply.Body.String())
+	}
+}
+
+func TestEightDigitMessageCodeTakesPriorityOverBroadTextRule(t *testing.T) {
+	server := testServer(t)
+	server.cfg.WeChatLoginMode = wechatLoginModeMessageCode
+	server.wx = fakeWeChatService{}
+	if _, err := server.management.UpdateReplies(0, WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{{
+		ID: "numeric-text", Name: "numeric text", Enabled: true, Trigger: "text", Match: "regex", Pattern: `^[0-9]{8}$`,
+		Reply: WeChatReply{Type: "text", Content: "ordinary numeric reply"},
+	}}}); err != nil {
+		t.Fatalf("save broad numeric rule: %v", err)
+	}
+	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
+	if err != nil {
+		t.Fatalf("create message-code scan: %v", err)
+	}
+	body := fmt.Sprintf(`<xml><ToUserName>official</ToUserName><FromUserName>numeric-login-user</FromUserName><CreateTime>1720000014</CreateTime><MsgType>text</MsgType><Content>%s</Content><MsgId>10014</MsgId></xml>`, scan.LoginCode)
+	recorder := performSignedWeChatCallback(t, server, body)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "登录已确认") || strings.Contains(recorder.Body.String(), "ordinary numeric reply") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	completed, ok := server.scanSnapshot(scan.ID)
+	if !ok || completed.User.OpenID != "numeric-login-user" {
+		t.Fatalf("login not completed: %#v ok=%t", completed, ok)
+	}
+}
+
 func TestSubscribeQRCodeCompletesLoginAndReturnsSubscribeReply(t *testing.T) {
 	server := testServer(t)
 	if _, err := server.management.UpdateReplies(0, WeChatReplySettings{
@@ -216,7 +267,7 @@ func TestMenuClickCannotCompleteLoginScene(t *testing.T) {
 	}
 }
 
-func TestWeChatAESCallbackDecryptsAndEncryptsManagedReply(t *testing.T) {
+func TestWeChatAESImportedKeywordUsesTextCallbackNotClickEvent(t *testing.T) {
 	cfg := testConfig()
 	cfg.WeChatEncodingAESKey = testWeChatEncodingAESKey()
 	server, err := NewServer(cfg)
@@ -224,13 +275,17 @@ func TestWeChatAESCallbackDecryptsAndEncryptsManagedReply(t *testing.T) {
 		t.Fatalf("new encrypted server: %v", err)
 	}
 	server.wx = fakeWeChatService{}
+	rules, err := decodeWeChatWebsiteMenuKeywordRules([]byte(currentWebsiteTextMenuFixture))
+	if err != nil {
+		t.Fatalf("decode menu keywords: %v", err)
+	}
 	if _, err := server.management.UpdateReplies(0, WeChatReplySettings{
-		Enabled:      true,
-		DefaultReply: &WeChatReply{Type: "text", Content: "安全回复"},
+		Enabled: true,
+		Rules:   rules,
 	}); err != nil {
 		t.Fatalf("save encrypted reply: %v", err)
 	}
-	plaintext := []byte(`<xml><ToUserName><![CDATA[official]]></ToUserName><FromUserName><![CDATA[user-aes]]></FromUserName><CreateTime>1720000003</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[任意消息]]></Content><MsgId>10003</MsgId></xml>`)
+	plaintext := []byte(`<xml><ToUserName><![CDATA[official]]></ToUserName><FromUserName><![CDATA[user-aes]]></FromUserName><CreateTime>1720000003</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[关于此公众号]]></Content><MsgId>10003</MsgId></xml>`)
 	encrypted, err := server.wxCryptor.Encrypt(plaintext)
 	if err != nil {
 		t.Fatalf("encrypt callback: %v", err)
@@ -260,8 +315,13 @@ func TestWeChatAESCallbackDecryptsAndEncryptsManagedReply(t *testing.T) {
 		t.Fatalf("decrypt response: %v", err)
 	}
 	var reply wechatPassiveReplyXML
-	if err := xml.Unmarshal(decrypted, &reply); err != nil || reply.Content != "安全回复" || reply.ToUserName != "user-aes" {
+	if err := xml.Unmarshal(decrypted, &reply); err != nil || reply.Content != "你好，感谢关注！\n这里是公众号介绍。" || reply.ToUserName != "user-aes" {
 		t.Fatalf("decrypted reply=%#v err=%v body=%s", reply, err, decrypted)
+	}
+	clickBody := `<xml><ToUserName>official</ToUserName><FromUserName>user-aes</FromUserName><CreateTime>1720000004</CreateTime><MsgType>event</MsgType><Event>CLICK</Event><EventKey>关于此公众号</EventKey></xml>`
+	clickReply := performEncryptedWeChatCallback(t, server, clickBody, "1720000004", "keyword-click-nonce")
+	if clickReply.Code != http.StatusOK || clickReply.Body.String() != "success" {
+		t.Fatalf("encrypted CLICK status=%d body=%q", clickReply.Code, clickReply.Body.String())
 	}
 }
 
@@ -274,6 +334,12 @@ func TestWeChatAESMessageCodeCompletesLogin(t *testing.T) {
 		t.Fatalf("new encrypted server: %v", err)
 	}
 	server.wx = fakeWeChatService{}
+	if _, err := server.management.UpdateReplies(0, WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{{
+		ID: "numeric-text", Name: "numeric text", Enabled: true, Trigger: "text", Match: "regex", Pattern: `^[0-9]{8}$`,
+		Reply: WeChatReply{Type: "text", Content: "ordinary numeric reply"},
+	}}}); err != nil {
+		t.Fatalf("save broad numeric rule: %v", err)
+	}
 	scan, err := server.createScanSession(context.Background(), scanKindLocal, oidcAuthRequest{}, "/")
 	if err != nil {
 		t.Fatalf("create message-code scan: %v", err)

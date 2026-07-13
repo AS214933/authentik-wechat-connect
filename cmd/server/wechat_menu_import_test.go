@@ -37,78 +37,99 @@ const currentWebsiteTextMenuFixture = `{
   }
 }`
 
-func TestDecodeCurrentWebsiteTextMenuForCreate(t *testing.T) {
-	menu, rules, imported, err := decodeWeChatAdminMenuPayload([]byte(currentWebsiteTextMenuFixture))
+func TestCurrentWebsiteTextMenuImportsAsKeywordReplies(t *testing.T) {
+	rules, err := decodeWeChatWebsiteMenuKeywordRules([]byte(currentWebsiteTextMenuFixture))
 	if err != nil {
-		t.Fatalf("decode current website menu: %v", err)
+		t.Fatalf("decode current website menu keywords: %v", err)
 	}
-	if !imported {
-		t.Fatal("current-menu response was not recognized as an import")
+	if len(rules) != 3 {
+		t.Fatalf("rules=%d want 3", len(rules))
 	}
-	if err := menu.Validate(); err != nil {
-		t.Fatalf("converted menu is not publishable: %v", err)
-	}
-	if len(menu.Button) != 2 || len(menu.Button[0].SubButton) != 2 {
-		t.Fatalf("converted menu shape=%#v", menu)
-	}
-	leaves := []WeChatMenuButton{menu.Button[0].SubButton[0], menu.Button[0].SubButton[1], menu.Button[1]}
-	if len(rules) != len(leaves) {
-		t.Fatalf("rules=%d leaves=%d", len(rules), len(leaves))
-	}
-	seenKeys := map[string]bool{}
-	for i, leaf := range leaves {
-		if leaf.Type != "click" || leaf.Key == "" {
-			t.Fatalf("leaf %d was not converted to click: %#v", i, leaf)
+	wantKeywords := []string{"关于此公众号", "我的主页和博客", "商务合作"}
+	seenIDs := make(map[string]bool)
+	for i, rule := range rules {
+		if !strings.HasPrefix(rule.ID, importedMenuKeywordRulePrefix) || seenIDs[rule.ID] {
+			t.Fatalf("rule %d has invalid or duplicate id: %#v", i, rule)
 		}
-		if seenKeys[leaf.Key] {
-			t.Fatalf("duplicate generated key %q", leaf.Key)
-		}
-		seenKeys[leaf.Key] = true
-		if rules[i].Trigger != "click" || rules[i].Match != "exact" || rules[i].Pattern != leaf.Key || rules[i].Reply.Type != "text" {
-			t.Fatalf("rule %d does not match leaf: %#v", i, rules[i])
+		seenIDs[rule.ID] = true
+		if rule.Trigger != "text" || rule.Match != "exact" || rule.Pattern != wantKeywords[i] || rule.Reply.Type != "text" {
+			t.Fatalf("rule %d is not an exact text keyword reply: %#v", i, rule)
 		}
 	}
 	if rules[0].Reply.Content != "你好，感谢关注！\n这里是公众号介绍。" {
-		t.Fatalf("first text reply=%q", rules[0].Reply.Content)
+		t.Fatalf("first reply=%q", rules[0].Reply.Content)
 	}
 
-	payload, err := json.Marshal(menu)
-	if err != nil {
-		t.Fatal(err)
+	settings := WeChatReplySettings{Enabled: true, Rules: rules}
+	reply, _ := settings.SelectReply(WeChatInboundMessage{MsgType: "text", Content: "关于此公众号"})
+	if reply == nil || reply.Content != rules[0].Reply.Content {
+		t.Fatalf("text keyword reply=%#v", reply)
 	}
-	for _, forbidden := range []string{`"type":"text"`, `"value"`, `"is_menu_open"`, `"selfmenu_info"`, `"list"`} {
-		if strings.Contains(string(payload), forbidden) {
-			t.Fatalf("menu/create payload contains %s: %s", forbidden, payload)
-		}
+	if reply, _ := settings.SelectReply(WeChatInboundMessage{MsgType: "event", Event: "CLICK", EventKey: "关于此公众号"}); reply != nil {
+		t.Fatalf("website keyword unexpectedly matched CLICK: %#v", reply)
 	}
 }
 
-func TestImportedTextMenuRulesReplaceOnlyPreviousImports(t *testing.T) {
-	_, imported, _, err := decodeWeChatAdminMenuPayload([]byte(currentWebsiteTextMenuFixture))
+func TestInactiveCurrentMenuCannotBecomeAPIMenuDraft(t *testing.T) {
+	_, imported, err := decodeWeChatAdminMenuPayload([]byte(currentWebsiteTextMenuFixture))
+	if !imported || err == nil || !strings.Contains(err.Error(), "is_menu_open=0") {
+		t.Fatalf("imported=%t error=%v", imported, err)
+	}
+}
+
+func TestImportedKeywordRulesReplaceOnlyGeneratedRules(t *testing.T) {
+	imported, err := decodeWeChatWebsiteMenuKeywordRules([]byte(currentWebsiteTextMenuFixture))
 	if err != nil {
 		t.Fatal(err)
 	}
 	settings := WeChatReplySettings{Rules: []WeChatReplyRule{
-		{ID: importedMenuReplyRulePrefix + "0123456789abcdef01234567", Name: "old import", Enabled: true, Trigger: "click", Match: "exact", Pattern: "old", Reply: WeChatReply{Type: "text", Content: "old"}},
+		{ID: importedMenuKeywordRulePrefix + "0123456789abcdef01234567", Name: "old keyword import", Enabled: true, Trigger: "text", Match: "exact", Pattern: "old", Reply: WeChatReply{Type: "text", Content: "old"}},
+		{ID: legacyImportedMenuClickRulePrefix + "0123456789abcdef01234567", Name: "failed click import", Enabled: true, Trigger: "click", Match: "exact", Pattern: "old-key", Reply: WeChatReply{Type: "text", Content: "old"}},
 		{ID: "user-rule", Name: "user rule", Enabled: true, Trigger: "text", Match: "exact", Pattern: "hello", Reply: WeChatReply{Type: "text", Content: "world"}},
 	}}
-	merged := mergeImportedMenuReplyRules(settings, imported)
-	if !merged.Enabled || len(merged.Rules) != len(imported)+1 {
+	merged, err := mergeImportedMenuKeywordRules(settings, imported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged.Enabled || len(merged.Rules) != len(imported)+2 {
 		t.Fatalf("merged settings=%#v", merged)
 	}
-	if merged.Rules[len(imported)].ID != "user-rule" {
-		t.Fatalf("user rule was not preserved: %#v", merged.Rules)
+	if !isLegacyImportedMenuClickRuleID(merged.Rules[0].ID) || merged.Rules[1].ID != "user-rule" {
+		t.Fatalf("user rule order was not preserved: %#v", merged.Rules)
 	}
 	for _, rule := range merged.Rules {
-		if rule.ID == importedMenuReplyRulePrefix+"0123456789abcdef01234567" {
-			t.Fatal("stale imported rule was preserved")
+		if isImportedMenuKeywordRuleID(rule.ID) && rule.Pattern == "old" {
+			t.Fatalf("stale generated rule was preserved: %#v", rule)
 		}
+	}
+	reply, ruleID := merged.SelectReply(WeChatInboundMessage{MsgType: "text", Content: "hello"})
+	if reply == nil || reply.Content != "world" || ruleID != "user-rule" {
+		t.Fatalf("existing user rule was not preserved: reply=%#v id=%q", reply, ruleID)
 	}
 }
 
-func TestCurrentMenuImportPreservesAPIActions(t *testing.T) {
+func TestImportedKeywordRulesRejectShadowingUserRules(t *testing.T) {
+	imported, err := decodeWeChatWebsiteMenuKeywordRules([]byte(currentWebsiteTextMenuFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range []WeChatReplyRule{
+		{ID: "exact", Name: "exact", Enabled: true, Trigger: "text", Match: "exact", Pattern: "关于此公众号", Reply: WeChatReply{Type: "text", Content: "existing"}},
+		{ID: "catch-all", Name: "catch all", Enabled: true, Trigger: "any_message", Match: "any", Reply: WeChatReply{Type: "text", Content: "existing"}},
+		{ID: "regex", Name: "regex", Enabled: true, Trigger: "text", Match: "regex", Pattern: ".*", Reply: WeChatReply{Type: "text", Content: "existing"}},
+	} {
+		t.Run(rule.ID, func(t *testing.T) {
+			settings := WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{rule}}
+			if _, err := mergeImportedMenuKeywordRules(settings, imported); err == nil || !strings.Contains(err.Error(), rule.ID) {
+				t.Fatalf("shadowing rule was accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestCurrentMenuImportPreservesActiveAPIActions(t *testing.T) {
 	raw := []byte(`{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"click","name":"帮助","key":"help"},{"type":"view","name":"网站","url":"https://example.com/"}]}}`)
-	menu, rules, imported, err := decodeWeChatAdminMenuPayload(raw)
+	menu, imported, err := decodeWeChatAdminMenuPayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,46 +137,61 @@ func TestCurrentMenuImportPreservesAPIActions(t *testing.T) {
 		{Type: "click", Name: "帮助", Key: "help"},
 		{Type: "view", Name: "网站", URL: "https://example.com/"},
 	}}
-	if !imported || len(rules) != 0 || !reflect.DeepEqual(menu, want) {
-		t.Fatalf("menu=%#v rules=%#v imported=%t", menu, rules, imported)
+	if !imported || !reflect.DeepEqual(menu, want) {
+		t.Fatalf("menu=%#v imported=%t", menu, imported)
 	}
 }
 
-func TestCurrentMenuImportRejectsNonReusableWebsiteMedia(t *testing.T) {
-	for _, typeName := range []string{"img", "voice", "video", "news"} {
+func TestCurrentWebsiteActionsCannotBecomeAPIMenuDraft(t *testing.T) {
+	for _, typeName := range []string{"text", "img", "voice", "video", "news"} {
 		t.Run(typeName, func(t *testing.T) {
 			raw := []byte(`{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"` + typeName + `","name":"素材","value":"upstream-value"}]}}`)
-			_, _, imported, err := decodeWeChatAdminMenuPayload(raw)
-			if !imported || err == nil || !strings.Contains(err.Error(), "button[0]") || !strings.Contains(err.Error(), "cannot be published") {
+			_, imported, err := decodeWeChatAdminMenuPayload(raw)
+			if !imported || err == nil || !strings.Contains(err.Error(), "button[0]") || !strings.Contains(err.Error(), "cannot be imported") {
 				t.Fatalf("imported=%t error=%v", imported, err)
 			}
 		})
 	}
 }
 
-func TestCurrentMenuImportRequiresContentsAndValidOpenState(t *testing.T) {
-	for _, raw := range []string{
-		`{"is_menu_open":0}`,
-		`{"is_menu_open":2,"selfmenu_info":{"button":[]}}`,
-	} {
-		if _, _, imported, err := decodeWeChatAdminMenuPayload([]byte(raw)); !imported || err == nil {
-			t.Fatalf("raw=%s imported=%t error=%v", raw, imported, err)
-		}
+func TestKeywordImportRejectsUnsupportedOrAmbiguousMenus(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "no contents", raw: `{"is_menu_open":0}`, want: "selfmenu_info"},
+		{name: "invalid open state", raw: `{"is_menu_open":2,"selfmenu_info":{"button":[]}}`, want: "0 or 1"},
+		{name: "missing open state", raw: `{"selfmenu_info":{"button":[]}}`, want: "is_menu_open"},
+		{name: "no text", raw: `{"is_menu_open":1,"selfmenu_info":{"button":[]}}`, want: "does not contain"},
+		{name: "API click", raw: `{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"click","name":"帮助","key":"help"}]}}`, want: "cannot be imported"},
+		{name: "duplicate keyword", raw: `{"is_menu_open":0,"selfmenu_info":{"button":[{"type":"text","name":"帮助","value":"one"},{"type":"text","name":"帮助","value":"two"}]}}`, want: "duplicates"},
+		{name: "login code keyword", raw: `{"is_menu_open":0,"selfmenu_info":{"button":[{"type":"text","name":"12345678","value":"reserved"}]}}`, want: "reserved"},
+		{name: "surrounding whitespace", raw: `{"is_menu_open":0,"selfmenu_info":{"button":[{"type":"text","name":" 帮助","value":"bad"}]}}`, want: "whitespace"},
+		{name: "conflicting fields", raw: `{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"text","name":"帮助","value":"reply","key":"other"}]}}`, want: "another action"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := decodeWeChatWebsiteMenuKeywordRules([]byte(test.raw))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v want substring %q", err, test.want)
+			}
+		})
 	}
 }
 
-func TestCurrentMenuImportRejectsNonDocumentedShapesAndConflictingFields(t *testing.T) {
+func TestCurrentMenuImportRejectsNonDocumentedShapes(t *testing.T) {
 	for _, raw := range []string{
 		`{"is_menu_open":1,"selfmenu_info":{"button":[{"name":"分组","sub_button":[]}]}}`,
 		`{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"click","name":"帮助","key":"help","news_info":{"list":[]}}]}}`,
 	} {
-		if _, _, imported, err := decodeWeChatAdminMenuPayload([]byte(raw)); !imported || err == nil {
+		if _, imported, err := decodeWeChatAdminMenuPayload([]byte(raw)); !imported || err == nil {
 			t.Fatalf("raw=%s imported=%t error=%v", raw, imported, err)
 		}
 	}
 }
 
-func TestCurrentTextMenuImportEnforcesReplyLength(t *testing.T) {
+func TestCurrentTextKeywordImportEnforcesReplyLength(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
 		content string
@@ -169,8 +205,8 @@ func TestCurrentTextMenuImportEnforcesReplyLength(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			raw := []byte(`{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"text","name":"文本","value":` + string(encoded) + `}]}}`)
-			_, _, _, err = decodeWeChatAdminMenuPayload(raw)
+			raw := []byte(`{"is_menu_open":0,"selfmenu_info":{"button":[{"type":"text","name":"文本","value":` + string(encoded) + `}]}}`)
+			_, err = decodeWeChatWebsiteMenuKeywordRules(raw)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("error=%v wantErr=%t", err, tt.wantErr)
 			}

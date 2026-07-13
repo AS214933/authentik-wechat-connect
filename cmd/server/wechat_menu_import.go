@@ -10,7 +10,10 @@ import (
 	"strings"
 )
 
-const importedMenuReplyRulePrefix = "__wechat_connect_menu_text_"
+const (
+	legacyImportedMenuClickRulePrefix = "__wechat_connect_menu_text_"
+	importedMenuKeywordRulePrefix     = "__wechat_connect_menu_keyword_"
+)
 
 type weChatCurrentMenuEnvelope struct {
 	IsMenuOpen   *int                       `json:"is_menu_open"`
@@ -57,67 +60,80 @@ func (l *weChatCurrentMenuButtonList) UnmarshalJSON(data []byte) error {
 }
 
 // decodeWeChatAdminMenuPayload accepts either the canonical menu/create body
-// or the documented get_current_selfmenu_info response. The latter is
-// normalized into a publishable menu and managed click reply rules.
-func decodeWeChatAdminMenuPayload(raw []byte) (WeChatMenu, []WeChatReplyRule, bool, error) {
+// or an active API-managed get_current_selfmenu_info response. Website menu
+// actions are deliberately not converted because doing so would require a
+// successful menu/create call before WeChat could emit their generated keys.
+func decodeWeChatAdminMenuPayload(raw []byte) (WeChatMenu, bool, error) {
 	var shape map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &shape); err != nil {
-		return WeChatMenu{}, nil, false, err
+		return WeChatMenu{}, false, err
 	}
 	_, hasOpenState := shape["is_menu_open"]
 	_, hasCurrentMenu := shape["selfmenu_info"]
 	if !hasOpenState && !hasCurrentMenu {
 		var menu WeChatMenu
 		if err := decodeStrictJSONValue(raw, &menu); err != nil {
-			return WeChatMenu{}, nil, false, err
+			return WeChatMenu{}, false, err
 		}
-		return menu, nil, false, nil
+		return menu, false, nil
 	}
 
-	var envelope weChatCurrentMenuEnvelope
-	if err := decodeStrictJSONValue(raw, &envelope); err != nil {
-		return WeChatMenu{}, nil, true, fmt.Errorf("decode get_current_selfmenu_info response: %w", err)
+	envelope, err := decodeWeChatCurrentMenuEnvelope(raw)
+	if err != nil {
+		return WeChatMenu{}, true, err
 	}
-	if envelope.IsMenuOpen != nil && *envelope.IsMenuOpen != 0 && *envelope.IsMenuOpen != 1 {
-		return WeChatMenu{}, nil, true, fmt.Errorf("get_current_selfmenu_info is_menu_open must be 0 or 1")
+	if *envelope.IsMenuOpen == 0 {
+		return WeChatMenu{}, true, errors.New("get_current_selfmenu_info reports is_menu_open=0; the website menu is inactive and cannot be imported as an API menu draft")
 	}
 	if envelope.SelfMenuInfo == nil {
-		return WeChatMenu{}, nil, true, errors.New("get_current_selfmenu_info response does not contain selfmenu_info")
+		return WeChatMenu{}, true, errors.New("get_current_selfmenu_info response does not contain selfmenu_info")
 	}
 
-	buttons, rules, err := convertWeChatCurrentMenuButtons(envelope.SelfMenuInfo.Button, "button")
+	buttons, err := convertWeChatCurrentMenuButtons(envelope.SelfMenuInfo.Button, "button")
 	if err != nil {
-		return WeChatMenu{}, nil, true, err
+		return WeChatMenu{}, true, err
 	}
-	return WeChatMenu{Button: buttons}, rules, true, nil
+	return WeChatMenu{Button: buttons}, true, nil
 }
 
-func convertWeChatCurrentMenuButtons(source []weChatCurrentMenuButton, path string) ([]WeChatMenuButton, []WeChatReplyRule, error) {
+func decodeWeChatCurrentMenuEnvelope(raw []byte) (weChatCurrentMenuEnvelope, error) {
+	var envelope weChatCurrentMenuEnvelope
+	if err := decodeStrictJSONValue(raw, &envelope); err != nil {
+		return weChatCurrentMenuEnvelope{}, fmt.Errorf("decode get_current_selfmenu_info response: %w", err)
+	}
+	if envelope.IsMenuOpen == nil {
+		return weChatCurrentMenuEnvelope{}, errors.New("get_current_selfmenu_info response does not contain is_menu_open")
+	}
+	if *envelope.IsMenuOpen != 0 && *envelope.IsMenuOpen != 1 {
+		return weChatCurrentMenuEnvelope{}, errors.New("get_current_selfmenu_info is_menu_open must be 0 or 1")
+	}
+	return envelope, nil
+}
+
+func convertWeChatCurrentMenuButtons(source []weChatCurrentMenuButton, path string) ([]WeChatMenuButton, error) {
 	buttons := make([]WeChatMenuButton, 0, len(source))
-	var rules []WeChatReplyRule
 	for i, current := range source {
 		buttonPath := fmt.Sprintf("%s[%d]", path, i)
-		button, nestedRules, err := convertWeChatCurrentMenuButton(current, buttonPath)
+		button, err := convertWeChatCurrentMenuButton(current, buttonPath)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		buttons = append(buttons, button)
-		rules = append(rules, nestedRules...)
 	}
-	return buttons, rules, nil
+	return buttons, nil
 }
 
-func convertWeChatCurrentMenuButton(current weChatCurrentMenuButton, path string) (WeChatMenuButton, []WeChatReplyRule, error) {
+func convertWeChatCurrentMenuButton(current weChatCurrentMenuButton, path string) (WeChatMenuButton, error) {
 	name := current.Name
 	if len(current.SubButton.List) != 0 {
 		if current.Type != "" || hasWeChatCurrentMenuActionFields(current) {
-			return WeChatMenuButton{}, nil, fmt.Errorf("%s: a menu group cannot contain type or action fields", path)
+			return WeChatMenuButton{}, fmt.Errorf("%s: a menu group cannot contain type or action fields", path)
 		}
-		children, rules, err := convertWeChatCurrentMenuButtons(current.SubButton.List, path+".sub_button")
+		children, err := convertWeChatCurrentMenuButtons(current.SubButton.List, path+".sub_button")
 		if err != nil {
-			return WeChatMenuButton{}, nil, err
+			return WeChatMenuButton{}, err
 		}
-		return WeChatMenuButton{Name: name, SubButton: children}, rules, nil
+		return WeChatMenuButton{Name: name, SubButton: children}, nil
 	}
 
 	typeName := normalizeWeChatValue(current.Type)
@@ -125,87 +141,159 @@ func convertWeChatCurrentMenuButton(current weChatCurrentMenuButton, path string
 	switch typeName {
 	case "click", "scancode_push", "scancode_waitmsg", "pic_sysphoto", "pic_photo_or_album", "pic_weixin", "location_select":
 		if err := validateWeChatCurrentMenuActionFields(current, path, map[string]bool{"key": true}); err != nil {
-			return WeChatMenuButton{}, nil, err
+			return WeChatMenuButton{}, err
 		}
 		button.Key = current.Key
 	case "view":
 		if err := validateWeChatCurrentMenuActionFields(current, path, map[string]bool{"url": true}); err != nil {
-			return WeChatMenuButton{}, nil, err
+			return WeChatMenuButton{}, err
 		}
 		button.URL = current.URL
 	case "media_id", "view_limited":
 		if err := validateWeChatCurrentMenuActionFields(current, path, map[string]bool{"media_id": true}); err != nil {
-			return WeChatMenuButton{}, nil, err
+			return WeChatMenuButton{}, err
 		}
 		button.MediaID = current.MediaID
 	case "article_id", "article_view_limited":
 		if err := validateWeChatCurrentMenuActionFields(current, path, map[string]bool{"article_id": true}); err != nil {
-			return WeChatMenuButton{}, nil, err
+			return WeChatMenuButton{}, err
 		}
 		button.ArticleID = current.ArticleID
 	case "miniprogram":
 		if err := validateWeChatCurrentMenuActionFields(current, path, map[string]bool{"url": true, "appid": true, "pagepath": true}); err != nil {
-			return WeChatMenuButton{}, nil, err
+			return WeChatMenuButton{}, err
 		}
 		button.URL = current.URL
 		button.AppID = current.AppID
 		button.PagePath = current.PagePath
 	case "text":
-		if current.Value == "" {
-			return WeChatMenuButton{}, nil, fmt.Errorf("%s: website text menu value is required", path)
-		}
-		if current.Key != "" || current.URL != "" || current.AppID != "" || current.PagePath != "" || current.MediaID != "" || current.ArticleID != "" || hasJSONValue(current.NewsInfo) {
-			return WeChatMenuButton{}, nil, fmt.Errorf("%s: website text menu contains fields for another action type", path)
-		}
-		key, rule := importedTextMenuAction(path, name, current.Value)
-		if err := rule.Validate(); err != nil {
-			return WeChatMenuButton{}, nil, fmt.Errorf("%s: convert website text menu: %w", path, err)
-		}
-		return WeChatMenuButton{Type: "click", Name: name, Key: key}, []WeChatReplyRule{rule}, nil
+		return WeChatMenuButton{}, fmt.Errorf("%s: website text menus cannot be imported as API click menus; import them as keyword replies instead", path)
 	case "img", "voice", "video", "news":
-		return WeChatMenuButton{}, nil, fmt.Errorf("%s: website menu type %q cannot be published by menu/create without migrating its media to a permanent API asset", path, typeName)
+		return WeChatMenuButton{}, fmt.Errorf("%s: website menu type %q cannot be imported as an API menu action", path, typeName)
 	case "":
-		return WeChatMenuButton{}, nil, fmt.Errorf("%s: leaf menu button type is required", path)
+		return WeChatMenuButton{}, fmt.Errorf("%s: leaf menu button type is required", path)
 	default:
-		return WeChatMenuButton{}, nil, fmt.Errorf("%s: unsupported current menu button type %q", path, current.Type)
+		return WeChatMenuButton{}, fmt.Errorf("%s: unsupported current menu button type %q", path, current.Type)
 	}
-	return button, nil, nil
+	return button, nil
 }
 
-func importedTextMenuAction(path, name, content string) (string, WeChatReplyRule) {
-	digest := sha256.Sum256([]byte(path + "\x00" + name + "\x00" + content))
+func decodeWeChatWebsiteMenuKeywordRules(raw []byte) ([]WeChatReplyRule, error) {
+	envelope, err := decodeWeChatCurrentMenuEnvelope(raw)
+	if err != nil {
+		return nil, err
+	}
+	if envelope.SelfMenuInfo == nil {
+		return nil, errors.New("get_current_selfmenu_info response does not contain selfmenu_info")
+	}
+	seenKeywords := make(map[string]string)
+	rules, err := convertWeChatWebsiteMenuKeywordButtons(envelope.SelfMenuInfo.Button, "button", seenKeywords)
+	if err != nil {
+		return nil, err
+	}
+	if len(rules) == 0 {
+		return nil, errors.New("current website menu does not contain any text actions to import")
+	}
+	return rules, nil
+}
+
+func convertWeChatWebsiteMenuKeywordButtons(source []weChatCurrentMenuButton, path string, seenKeywords map[string]string) ([]WeChatReplyRule, error) {
+	var rules []WeChatReplyRule
+	for i, current := range source {
+		buttonPath := fmt.Sprintf("%s[%d]", path, i)
+		if len(current.SubButton.List) != 0 {
+			if current.Type != "" || hasWeChatCurrentMenuActionFields(current) {
+				return nil, fmt.Errorf("%s: a menu group cannot contain type or action fields", buttonPath)
+			}
+			nested, err := convertWeChatWebsiteMenuKeywordButtons(current.SubButton.List, buttonPath+".sub_button", seenKeywords)
+			if err != nil {
+				return nil, err
+			}
+			rules = append(rules, nested...)
+			continue
+		}
+
+		if normalizeWeChatValue(current.Type) != "text" {
+			return nil, fmt.Errorf("%s: website menu type %q cannot be imported as a text keyword reply", buttonPath, current.Type)
+		}
+		if current.Value == "" {
+			return nil, fmt.Errorf("%s: website text menu value is required", buttonPath)
+		}
+		if current.Key != "" || current.URL != "" || current.AppID != "" || current.PagePath != "" || current.MediaID != "" || current.ArticleID != "" || hasJSONValue(current.NewsInfo) {
+			return nil, fmt.Errorf("%s: website text menu contains fields for another action type", buttonPath)
+		}
+		keyword := current.Name
+		if keyword == "" || strings.TrimSpace(keyword) != keyword {
+			return nil, fmt.Errorf("%s: website text menu name must be non-empty and have no surrounding whitespace", buttonPath)
+		}
+		if normalizeLoginCode(keyword) != "" {
+			return nil, fmt.Errorf("%s: eight-digit numeric menu names are reserved for login codes", buttonPath)
+		}
+		if previousPath, exists := seenKeywords[keyword]; exists {
+			return nil, fmt.Errorf("%s: keyword %q duplicates %s", buttonPath, keyword, previousPath)
+		}
+		seenKeywords[keyword] = buttonPath
+
+		rule := importedTextMenuKeywordRule(buttonPath, keyword, current.Value)
+		if err := rule.Validate(); err != nil {
+			return nil, fmt.Errorf("%s: convert website text menu to keyword reply: %w", buttonPath, err)
+		}
+		rules = append(rules, rule)
+	}
+	return rules, nil
+}
+
+func importedTextMenuKeywordRule(path, keyword, content string) WeChatReplyRule {
+	digest := sha256.Sum256([]byte(path + "\x00" + keyword + "\x00" + content))
 	suffix := fmt.Sprintf("%x", digest[:12])
-	key := "wechat_connect_text_" + suffix
-	return key, WeChatReplyRule{
-		ID:      importedMenuReplyRulePrefix + suffix,
-		Name:    "导入菜单：" + name,
+	return WeChatReplyRule{
+		ID:      importedMenuKeywordRulePrefix + suffix,
+		Name:    "菜单关键词：" + keyword,
 		Enabled: true,
-		Trigger: "click",
+		Trigger: "text",
 		Match:   "exact",
-		Pattern: key,
+		Pattern: keyword,
 		Reply:   WeChatReply{Type: "text", Content: content},
 	}
 }
 
-func mergeImportedMenuReplyRules(settings WeChatReplySettings, imported []WeChatReplyRule) WeChatReplySettings {
+func mergeImportedMenuKeywordRules(settings WeChatReplySettings, imported []WeChatReplyRule) (WeChatReplySettings, error) {
 	settings = cloneWeChatReplySettings(settings)
 	rules := make([]WeChatReplyRule, 0, len(imported)+len(settings.Rules))
-	rules = append(rules, imported...)
 	for _, rule := range settings.Rules {
-		if isImportedMenuReplyRuleID(rule.ID) {
+		if isImportedMenuKeywordRuleID(rule.ID) {
 			continue
+		}
+		if rule.Enabled {
+			for _, keywordRule := range imported {
+				message := WeChatInboundMessage{MsgType: "text", Content: keywordRule.Pattern}
+				if ruleMatchesWeChatMessage(&rule, message) {
+					return WeChatReplySettings{}, fmt.Errorf("keyword %q is shadowed by enabled reply rule %q", keywordRule.Pattern, rule.ID)
+				}
+			}
 		}
 		rules = append(rules, rule)
 	}
+	// Imported rules come last so importing cannot change the precedence of
+	// existing user-managed rules.
+	rules = append(rules, imported...)
 	settings.Rules = rules
 	if len(imported) != 0 {
 		settings.Enabled = true
 	}
-	return settings
+	return settings, nil
 }
 
-func isImportedMenuReplyRuleID(id string) bool {
-	suffix, ok := strings.CutPrefix(id, importedMenuReplyRulePrefix)
+func isImportedMenuKeywordRuleID(id string) bool {
+	return hasImportedMenuRuleIDPrefix(id, importedMenuKeywordRulePrefix)
+}
+
+func isLegacyImportedMenuClickRuleID(id string) bool {
+	return hasImportedMenuRuleIDPrefix(id, legacyImportedMenuClickRulePrefix)
+}
+
+func hasImportedMenuRuleIDPrefix(id, prefix string) bool {
+	suffix, ok := strings.CutPrefix(id, prefix)
 	if !ok || len(suffix) != 24 {
 		return false
 	}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,7 @@ type wechatAdminTestMenuService struct {
 	publishErr      error
 	currentErr      error
 	deleteErr       error
+	getCurrentHook  func()
 }
 
 func (f *wechatAdminTestMenuService) PublishMenu(_ context.Context, menu WeChatMenu) error {
@@ -40,6 +42,9 @@ func (f *wechatAdminTestMenuService) GetMenu(context.Context) (json.RawMessage, 
 
 func (f *wechatAdminTestMenuService) GetCurrentMenu(context.Context) (json.RawMessage, error) {
 	f.getCurrentCalls++
+	if f.getCurrentHook != nil {
+		f.getCurrentHook()
+	}
 	return append(json.RawMessage(nil), f.current...), f.currentErr
 }
 
@@ -60,7 +65,13 @@ func TestWeChatAdminPageIsPublicAndCSPProtected(t *testing.T) {
 		t.Fatalf("unexpected CSP=%q", csp)
 	}
 	body := recorder.Body.String()
-	for _, required := range []string{"sessionStorage", "If-Match", "window.confirm", "/api/admin/wechat/menu/remote", "importRemoteButton", "defaultReplyType", "addRuleButton"} {
+	for _, required := range []string{
+		"sessionStorage", "If-Match", "window.confirm", "/api/admin/wechat/menu/remote/import-text-replies",
+		"importKeywordRepliesButton", "importRemoteDraftButton", "menuPlatformNotice", "menuPermissionStatus",
+		"读取成功不代表账号拥有发布权限", "直接发送完整按钮名称", "点击不会产生本服务可处理的 CLICK 事件",
+		"丢弃尚未保存的回复编辑", "applyReplyState(saved.payload.replies)",
+		"defaultReplyType", "addRuleButton",
+	} {
 		if !strings.Contains(body, required) {
 			t.Errorf("admin page missing %q", required)
 		}
@@ -147,6 +158,7 @@ func TestEveryWeChatAdminAPIRequiresBearerToken(t *testing.T) {
 		{method: http.MethodPut, path: "/api/admin/wechat/menu", body: `{}`},
 		{method: http.MethodPost, path: "/api/admin/wechat/menu/publish"},
 		{method: http.MethodGet, path: "/api/admin/wechat/menu/remote"},
+		{method: http.MethodPost, path: "/api/admin/wechat/menu/remote/import-text-replies"},
 		{method: http.MethodDelete, path: "/api/admin/wechat/menu/remote"},
 	}
 	for _, request := range requests {
@@ -291,45 +303,226 @@ func TestWeChatAdminMenuSavePublishRemoteAndDelete(t *testing.T) {
 	}
 }
 
-func TestWeChatAdminImportsWebsiteTextMenuAndPublishesCanonicalMenu(t *testing.T) {
+func TestWeChatAdminImportsWebsiteTextMenuAsKeywordReplies(t *testing.T) {
 	server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
-	saved := performWeChatAdminTestRequest(server, http.MethodPut, "/api/admin/wechat/menu", currentWebsiteTextMenuFixture, wechatAdminTestToken, `"0"`)
-	if saved.Code != http.StatusOK || saved.Header().Get("ETag") != `"1"` {
-		t.Fatalf("save status=%d ETag=%q body=%s", saved.Code, saved.Header().Get("ETag"), saved.Body.String())
+	draft := validWeChatAdminTestMenu()
+	if _, err := server.management.UpdateMenu(0, draft); err != nil {
+		t.Fatalf("seed menu: %v", err)
+	}
+	manualRule := WeChatReplyRule{ID: "manual", Name: "manual", Enabled: true, Trigger: "text", Match: "exact", Pattern: "hello", Reply: WeChatReply{Type: "text", Content: "world"}}
+	legacyRule := WeChatReplyRule{ID: legacyImportedMenuClickRulePrefix + "0123456789abcdef01234567", Name: "legacy API menu reply", Enabled: true, Trigger: "click", Match: "exact", Pattern: "help", Reply: WeChatReply{Type: "text", Content: "legacy help"}}
+	if _, err := server.management.UpdateReplies(1, WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{manualRule, legacyRule}}); err != nil {
+		t.Fatalf("seed replies: %v", err)
+	}
+	fake.current = json.RawMessage(currentWebsiteTextMenuFixture)
+	imported := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, `"2"`)
+	if imported.Code != http.StatusOK || imported.Header().Get("ETag") != `"3"` {
+		t.Fatalf("import status=%d ETag=%q body=%s", imported.Code, imported.Header().Get("ETag"), imported.Body.String())
 	}
 	state := server.management.Snapshot()
-	if !state.Replies.Enabled || len(state.Replies.Rules) != 3 || len(state.Menu.Button) != 2 {
-		t.Fatalf("imported state=%#v", state)
+	if fake.getCurrentCalls != 1 || state.Revision != 3 || !reflect.DeepEqual(state.Menu, draft) || !state.Replies.Enabled || len(state.Replies.Rules) != 5 {
+		t.Fatalf("current calls=%d imported state=%#v", fake.getCurrentCalls, state)
 	}
-	firstButton := state.Menu.Button[0].SubButton[0]
-	reply, ruleID := state.Replies.SelectReply(WeChatInboundMessage{MsgType: "event", Event: "CLICK", EventKey: firstButton.Key})
-	if reply == nil || reply.Type != "text" || reply.Content != "你好，感谢关注！\n这里是公众号介绍。" || !strings.HasPrefix(ruleID, importedMenuReplyRulePrefix) {
-		t.Fatalf("click reply=%#v rule=%q", reply, ruleID)
+	if !reflect.DeepEqual(state.Replies.Rules[0], manualRule) {
+		t.Fatalf("manual rule was not preserved first: %#v", state.Replies.Rules)
 	}
+	legacyReply, legacyRuleID := state.Replies.SelectReply(WeChatInboundMessage{MsgType: "event", Event: "CLICK", EventKey: "help"})
+	if legacyReply == nil || legacyReply.Content != "legacy help" || legacyRuleID != legacyRule.ID {
+		t.Fatalf("legacy API menu reply was not preserved: reply=%#v rule=%q", legacyReply, legacyRuleID)
+	}
+	reply, ruleID := state.Replies.SelectReply(WeChatInboundMessage{MsgType: "text", Content: "关于此公众号"})
+	if reply == nil || reply.Content != "你好，感谢关注！\n这里是公众号介绍。" || !strings.HasPrefix(ruleID, importedMenuKeywordRulePrefix) {
+		t.Fatalf("keyword reply=%#v rule=%q", reply, ruleID)
+	}
+	if reply, _ := state.Replies.SelectReply(WeChatInboundMessage{MsgType: "event", Event: "CLICK", EventKey: "关于此公众号"}); reply != nil {
+		t.Fatalf("keyword import unexpectedly created a CLICK reply: %#v", reply)
+	}
+}
 
-	published := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/publish", "", wechatAdminTestToken, `"1"`)
-	if published.Code != http.StatusOK || fake.publishCalls != 1 || !reflect.DeepEqual(fake.published, state.Menu) {
-		t.Fatalf("publish status=%d calls=%d menu=%#v body=%s", published.Code, fake.publishCalls, fake.published, published.Body.String())
+func TestWeChatAdminKeywordImportFailureIsAtomic(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "duplicate", raw: `{"is_menu_open":0,"selfmenu_info":{"button":[{"type":"text","name":"帮助","value":"one"},{"type":"text","name":"帮助","value":"two"}]}}`, want: "duplicates"},
+		{name: "login code", raw: `{"is_menu_open":0,"selfmenu_info":{"button":[{"type":"text","name":"12345678","value":"reserved"}]}}`, want: "reserved"},
+		{name: "mixed action", raw: `{"is_menu_open":0,"selfmenu_info":{"button":[{"type":"text","name":"帮助","value":"reply"},{"type":"view","name":"网站","url":"https://example.com/"}]}}`, want: "cannot be imported"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
+			original := WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{{ID: "manual", Name: "manual", Enabled: true, Trigger: "text", Match: "exact", Pattern: "hello", Reply: WeChatReply{Type: "text", Content: "world"}}}}
+			if _, err := server.management.UpdateReplies(0, original); err != nil {
+				t.Fatal(err)
+			}
+			fake.current = json.RawMessage(test.raw)
+			recorder := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, `"1"`)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), test.want) {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			state := server.management.Snapshot()
+			if state.Revision != 1 || !reflect.DeepEqual(state.Replies, original) {
+				t.Fatalf("failed import changed state=%#v", state)
+			}
+		})
 	}
-	payload, err := json.Marshal(fake.published)
-	if err != nil {
+}
+
+func TestWeChatAdminKeywordImportRejectsShadowedRulesAtomically(t *testing.T) {
+	server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
+	original := WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{{ID: "catch-all", Name: "catch all", Enabled: true, Trigger: "any_message", Match: "any", Reply: WeChatReply{Type: "text", Content: "default-like"}}}}
+	if _, err := server.management.UpdateReplies(0, original); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(payload), `"type":"text"`) || strings.Contains(string(payload), `"value"`) {
-		t.Fatalf("published invalid menu payload: %s", payload)
+	fake.current = json.RawMessage(currentWebsiteTextMenuFixture)
+	recorder := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, `"1"`)
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "catch-all") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	state := server.management.Snapshot()
+	if state.Revision != 1 || !reflect.DeepEqual(state.Replies, original) {
+		t.Fatalf("shadowed import changed state=%#v", state)
+	}
+}
+
+func TestWeChatAdminKeywordImportIsRepeatableAndRevisionChecked(t *testing.T) {
+	server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
+	menu := validWeChatAdminTestMenu()
+	if _, err := server.management.UpdateMenu(0, menu); err != nil {
+		t.Fatal(err)
+	}
+	defaultReply := &WeChatReply{Type: "text", Content: "default"}
+	manual := WeChatReplyRule{ID: "manual", Name: "manual", Enabled: true, Trigger: "text", Match: "exact", Pattern: "hello", Reply: WeChatReply{Type: "text", Content: "world"}}
+	if _, err := server.management.UpdateReplies(1, WeChatReplySettings{Rules: []WeChatReplyRule{manual}, DefaultReply: defaultReply}); err != nil {
+		t.Fatal(err)
+	}
+	fake.current = json.RawMessage(currentWebsiteTextMenuFixture)
+
+	first := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, `"2"`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	firstState := server.management.Snapshot()
+	firstRules := cloneWeChatReplySettings(firstState.Replies).Rules
+
+	staleReads := fake.getCurrentCalls
+	stale := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, `"2"`)
+	if stale.Code != http.StatusPreconditionFailed || stale.Header().Get("ETag") != `"3"` || fake.getCurrentCalls != staleReads {
+		t.Fatalf("stale status=%d ETag=%q reads=%d body=%s", stale.Code, stale.Header().Get("ETag"), fake.getCurrentCalls, stale.Body.String())
+	}
+	if !reflect.DeepEqual(server.management.Snapshot(), firstState) {
+		t.Fatal("stale import changed state")
+	}
+
+	second := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, `"3"`)
+	if second.Code != http.StatusOK || second.Header().Get("ETag") != `"4"` {
+		t.Fatalf("second status=%d ETag=%q body=%s", second.Code, second.Header().Get("ETag"), second.Body.String())
+	}
+	secondState := server.management.Snapshot()
+	if !reflect.DeepEqual(secondState.Menu, menu) || !reflect.DeepEqual(secondState.Replies.Rules, firstRules) || !reflect.DeepEqual(secondState.Replies.DefaultReply, defaultReply) {
+		t.Fatalf("repeat import changed data: first=%#v second=%#v", firstState, secondState)
+	}
+}
+
+func TestWeChatAdminAPICurrentMenuImportDoesNotTouchReplies(t *testing.T) {
+	server, _ := newWeChatAdminTestServer(t, wechatAdminTestToken)
+	replies := WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{
+		{ID: "manual-click", Name: "manual click", Enabled: true, Trigger: "click", Match: "exact", Pattern: "help", Reply: WeChatReply{Type: "text", Content: "help reply"}},
+		{ID: importedMenuKeywordRulePrefix + "0123456789abcdef01234567", Name: "menu keyword", Enabled: true, Trigger: "text", Match: "exact", Pattern: "关于", Reply: WeChatReply{Type: "text", Content: "about"}},
+	}}
+	if _, err := server.management.UpdateReplies(0, replies); err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"click","name":"帮助","key":"help"}]}}`
+	first := performWeChatAdminTestRequest(server, http.MethodPut, "/api/admin/wechat/menu", raw, wechatAdminTestToken, `"1"`)
+	second := performWeChatAdminTestRequest(server, http.MethodPut, "/api/admin/wechat/menu", raw, wechatAdminTestToken, `"2"`)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK {
+		t.Fatalf("first=%d %s second=%d %s", first.Code, first.Body.String(), second.Code, second.Body.String())
+	}
+	if !reflect.DeepEqual(server.management.Snapshot().Replies, replies) {
+		t.Fatalf("API menu import changed replies: %#v", server.management.Snapshot().Replies)
+	}
+}
+
+func TestWeChatAdminKeywordImportGatewayAndCapacityFailuresAreAtomic(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*wechatAdminTestMenuService, *Server)
+		want  int
+	}{
+		{name: "upstream failure", want: http.StatusBadGateway, setup: func(fake *wechatAdminTestMenuService, _ *Server) {
+			fake.currentErr = errors.New("unavailable")
+		}},
+		{name: "invalid JSON", want: http.StatusBadGateway, setup: func(fake *wechatAdminTestMenuService, _ *Server) {
+			fake.current = json.RawMessage(`not-json`)
+		}},
+		{name: "too many rules", want: http.StatusBadRequest, setup: func(fake *wechatAdminTestMenuService, server *Server) {
+			rules := make([]WeChatReplyRule, maxWeChatReplyRules-2)
+			for i := range rules {
+				rules[i] = WeChatReplyRule{ID: "rule-" + strconv.Itoa(i), Name: "rule", Enabled: true, Trigger: "text", Match: "exact", Pattern: "value-" + strconv.Itoa(i), Reply: WeChatReply{Type: "text", Content: "reply"}}
+			}
+			if _, err := server.management.UpdateReplies(0, WeChatReplySettings{Enabled: true, Rules: rules}); err != nil {
+				t.Fatalf("seed rules: %v", err)
+			}
+			fake.current = json.RawMessage(currentWebsiteTextMenuFixture)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
+			test.setup(fake, server)
+			before := server.management.Snapshot()
+			recorder := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, wechatManagementETag(before.Revision))
+			if recorder.Code != test.want {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			if !reflect.DeepEqual(server.management.Snapshot(), before) {
+				t.Fatal("failed import changed state")
+			}
+		})
+	}
+}
+
+func TestWeChatAdminKeywordImportPreservesConcurrentReplyUpdate(t *testing.T) {
+	server, fake := newWeChatAdminTestServer(t, wechatAdminTestToken)
+	fake.current = json.RawMessage(currentWebsiteTextMenuFixture)
+	concurrent := WeChatReplySettings{Enabled: true, Rules: []WeChatReplyRule{{ID: "concurrent", Name: "concurrent", Enabled: true, Trigger: "text", Match: "exact", Pattern: "hello", Reply: WeChatReply{Type: "text", Content: "world"}}}}
+	fake.getCurrentHook = func() {
+		fake.getCurrentHook = nil
+		if _, err := server.management.UpdateReplies(0, concurrent); err != nil {
+			t.Fatalf("concurrent update: %v", err)
+		}
+	}
+	recorder := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/remote/import-text-replies", "", wechatAdminTestToken, `"0"`)
+	if recorder.Code != http.StatusPreconditionFailed || recorder.Header().Get("ETag") != `"1"` {
+		t.Fatalf("status=%d ETag=%q body=%s", recorder.Code, recorder.Header().Get("ETag"), recorder.Body.String())
+	}
+	state := server.management.Snapshot()
+	if state.Revision != 1 || !reflect.DeepEqual(state.Replies, concurrent) {
+		t.Fatalf("concurrent state was overwritten: %#v", state)
 	}
 }
 
 func TestWeChatAdminRejectedMenuImportDoesNotChangeState(t *testing.T) {
-	server, _ := newWeChatAdminTestServer(t, wechatAdminTestToken)
-	raw := `{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"video","name":"视频","value":"https://example.com/video.mp4"}]}}`
-	recorder := performWeChatAdminTestRequest(server, http.MethodPut, "/api/admin/wechat/menu", raw, wechatAdminTestToken, `"0"`)
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "button[0]") {
-		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
-	}
-	state := server.management.Snapshot()
-	if state.Revision != 0 || len(state.Menu.Button) != 0 || len(state.Replies.Rules) != 0 {
-		t.Fatalf("rejected import changed state=%#v", state)
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "inactive website menu", raw: currentWebsiteTextMenuFixture, want: "is_menu_open=0"},
+		{name: "website media", raw: `{"is_menu_open":1,"selfmenu_info":{"button":[{"type":"video","name":"视频","value":"https://example.com/video.mp4"}]}}`, want: "button[0]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, _ := newWeChatAdminTestServer(t, wechatAdminTestToken)
+			recorder := performWeChatAdminTestRequest(server, http.MethodPut, "/api/admin/wechat/menu", test.raw, wechatAdminTestToken, `"0"`)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), test.want) {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+			state := server.management.Snapshot()
+			if state.Revision != 0 || len(state.Menu.Button) != 0 || len(state.Replies.Rules) != 0 {
+				t.Fatalf("rejected import changed state=%#v", state)
+			}
+		})
 	}
 }
 
@@ -434,9 +627,21 @@ func TestWeChatAdminMenuFailuresAreSafe(t *testing.T) {
 			t.Fatalf("seed menu: %v", err)
 		}
 		fake.publishErr = &wechatMenuAPIError{Operation: "publish", Code: 48001, Message: "api unauthorized"}
+		before := server.management.Snapshot()
 		recorder := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/publish", "", wechatAdminTestToken, `"1"`)
-		if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "48001") || !strings.Contains(recorder.Body.String(), "permission to read") {
+		var payload struct {
+			Error           string `json:"error"`
+			WeChatErrorCode int    `json:"wechat_error_code"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if recorder.Code != http.StatusBadGateway || payload.WeChatErrorCode != 48001 || !strings.Contains(payload.Error, "读取当前菜单的权限不代表可以发布") || !reflect.DeepEqual(server.management.Snapshot(), before) {
 			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		retried := performWeChatAdminTestRequest(server, http.MethodPost, "/api/admin/wechat/menu/publish", "", wechatAdminTestToken, `"1"`)
+		if retried.Code != http.StatusBadGateway || fake.publishCalls != 2 || !reflect.DeepEqual(server.management.Snapshot(), before) {
+			t.Fatalf("retry status=%d calls=%d body=%s", retried.Code, fake.publishCalls, retried.Body.String())
 		}
 	})
 }

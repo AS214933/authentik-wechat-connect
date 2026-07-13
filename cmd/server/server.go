@@ -199,6 +199,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/admin/wechat/menu", s.handleWeChatAdminMenu)
 	mux.HandleFunc("POST /api/admin/wechat/menu/publish", s.handleWeChatAdminMenuPublish)
 	mux.HandleFunc("GET /api/admin/wechat/menu/remote", s.handleWeChatAdminMenuRemote)
+	mux.HandleFunc("POST /api/admin/wechat/menu/remote/import-text-replies", s.handleWeChatAdminMenuKeywordImport)
 	mux.HandleFunc("DELETE /api/admin/wechat/menu/remote", s.handleWeChatAdminMenuDelete)
 	mux.HandleFunc("GET /api/me", s.handleAPIMe)
 	mux.HandleFunc("POST /api/logout", s.handleAPILogout)

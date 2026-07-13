@@ -99,7 +99,7 @@ func (s *Server) handleWeChatAdminMenu(w http.ResponseWriter, r *http.Request) {
 	if !decodeWeChatAdminRequest(w, r, &raw) {
 		return
 	}
-	menu, importedRules, imported, err := decodeWeChatAdminMenuPayload(raw)
+	menu, _, err := decodeWeChatAdminMenuPayload(raw)
 	if err != nil {
 		publicError(w, http.StatusBadRequest, fmt.Errorf("invalid menu: %w", err))
 		return
@@ -113,17 +113,61 @@ func (s *Server) handleWeChatAdminMenu(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var state WeChatManagementState
-	if imported {
-		replies := mergeImportedMenuReplyRules(s.management.Snapshot().Replies, importedRules)
-		if err := replies.Validate(); err != nil {
-			publicError(w, http.StatusBadRequest, fmt.Errorf("invalid imported menu replies: %w", err))
-			return
-		}
-		state, err = s.management.UpdateMenuAndReplies(expectedRevision, menu, replies)
-	} else {
-		state, err = s.management.UpdateMenu(expectedRevision, menu)
+	state, err := s.management.UpdateMenu(expectedRevision, menu)
+	if err != nil {
+		s.handleWeChatManagementUpdateError(w, err)
+		return
 	}
+	s.writeWeChatAdminState(w, http.StatusOK, state)
+}
+
+func (s *Server) handleWeChatAdminMenuKeywordImport(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWeChatAdmin(w, r) {
+		return
+	}
+	expectedRevision, ok := readWeChatAdminRevision(w, r)
+	if !ok {
+		return
+	}
+	if s.management == nil {
+		publicError(w, http.StatusInternalServerError, errors.New("WeChat management store is unavailable"))
+		return
+	}
+	if s.wxMenu == nil {
+		publicError(w, http.StatusBadGateway, errors.New("WeChat menu service is unavailable"))
+		return
+	}
+
+	state := s.management.Snapshot()
+	if expectedRevision != state.Revision {
+		s.handleWeChatManagementUpdateError(w, fmt.Errorf("%w: expected %d, current %d", errManagementRevisionConflict, expectedRevision, state.Revision))
+		return
+	}
+	raw, err := s.wxMenu.GetCurrentMenu(r.Context())
+	if err != nil {
+		s.writeWeChatMenuGatewayError(w, "read current menu", err)
+		return
+	}
+	if !json.Valid(raw) {
+		log.Printf("import current WeChat menu text replies: upstream returned invalid JSON")
+		publicError(w, http.StatusBadGateway, errors.New("WeChat returned an invalid current-menu response"))
+		return
+	}
+	importedRules, err := decodeWeChatWebsiteMenuKeywordRules(raw)
+	if err != nil {
+		publicError(w, http.StatusBadRequest, fmt.Errorf("current menu cannot be imported as keyword replies: %w", err))
+		return
+	}
+	replies, err := mergeImportedMenuKeywordRules(state.Replies, importedRules)
+	if err != nil {
+		publicError(w, http.StatusConflict, fmt.Errorf("menu keyword replies conflict with existing rules: %w", err))
+		return
+	}
+	if err := replies.Validate(); err != nil {
+		publicError(w, http.StatusBadRequest, fmt.Errorf("invalid imported menu keyword replies: %w", err))
+		return
+	}
+	state, err = s.management.UpdateReplies(expectedRevision, replies)
 	if err != nil {
 		s.handleWeChatManagementUpdateError(w, err)
 		return
@@ -209,8 +253,8 @@ func (s *Server) writeWeChatMenuGatewayError(w http.ResponseWriter, operation st
 	var apiError *wechatMenuAPIError
 	if errors.As(err, &apiError) {
 		message := strings.Join(strings.Fields(apiError.Message), " ")
-		if apiError.Code == 48001 {
-			message += "; this account is not authorized to call menu/create; permission to read the current menu does not grant permission to publish one, and unverified Subscription Accounts generally cannot publish menus through this API"
+		if apiError.Code == 48001 && operation == "publish" {
+			message += "; 当前账号没有 menu/create 权限。读取当前菜单的权限不代表可以发布；个人或未认证订阅号无法通过该接口恢复菜单点击，请改用发送关键词"
 		}
 		if s.cfg.WeChatAdminToken != "" {
 			message = strings.ReplaceAll(message, s.cfg.WeChatAdminToken, "[REDACTED]")
@@ -220,7 +264,10 @@ func (s *Server) writeWeChatMenuGatewayError(w http.ResponseWriter, operation st
 		}
 		safeError := fmt.Errorf("WeChat menu %s failed with error %d: %s", operation, apiError.Code, message)
 		log.Printf("%v", safeError)
-		publicError(w, http.StatusBadGateway, safeError)
+		writeJSON(w, http.StatusBadGateway, struct {
+			Error           string `json:"error"`
+			WeChatErrorCode int    `json:"wechat_error_code"`
+		}{Error: safeError.Error(), WeChatErrorCode: apiError.Code})
 		return
 	}
 	safeError := fmt.Errorf("WeChat menu %s request failed", operation)
@@ -432,6 +479,11 @@ const wechatAdminPageHTML = `<!doctype html>
     .rule-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
     .rule-title code { color: var(--muted); overflow-wrap: anywhere; }
     .empty { padding: 28px 14px; border: 1px dashed #b9c4bf; border-radius: var(--radius); text-align: center; color: var(--muted); }
+    .notice { margin: 0 0 16px; padding: 12px 14px; border: 1px solid #f6c98d; border-radius: var(--radius); background: #fff8eb; color: #713b0b; }
+    details.section { padding: 0; }
+    details.section > summary { cursor: pointer; padding: 18px 22px; font-weight: 700; font-size: 16px; }
+    details.section[open] > summary { border-bottom: 1px solid var(--border); }
+    .details-body { padding: 22px; }
     .menu-editor { min-height: 390px; line-height: 1.55; tab-size: 2; }
     .remote-output { min-height: 150px; max-height: 420px; margin: 14px 0 0; overflow: auto; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: #111815; color: #d6e3dc; white-space: pre-wrap; overflow-wrap: anywhere; }
     .callback { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 8px 12px; margin: 0; }
@@ -523,29 +575,36 @@ const wechatAdminPageHTML = `<!doctype html>
 
         <section id="menuPanel" class="panel" hidden>
           <div class="section">
-            <div class="section-head"><div><h2>菜单草稿</h2></div></div>
-            <label class="field">
-              <span>菜单 JSON</span>
-              <textarea id="menuEditor" class="json menu-editor" spellcheck="false"></textarea>
-            </label>
-            <div class="actions">
-              <button id="saveMenuButton" type="button">保存草稿</button>
-              <button id="publishMenuButton" class="secondary" type="button">发布已保存草稿</button>
-            </div>
-            <p id="menuStatus" class="status" role="status" aria-live="polite"></p>
-          </div>
-          <div class="section">
             <div class="section-head">
-              <div><h2>远端菜单</h2></div>
-              <div class="actions">
-                <button id="readRemoteButton" class="secondary" type="button">读取远端</button>
-                <button id="importRemoteButton" class="secondary" type="button">导入为草稿</button>
-                <button id="deleteRemoteButton" class="danger" type="button">删除远端</button>
-              </div>
+              <div><h2>公众平台文字菜单</h2><p>读取接口可用于诊断，但读取成功不代表账号拥有发布权限。</p></div>
+            </div>
+            <p id="menuPlatformNotice" class="notice">微信规则：启用消息推送后，公众平台后台设置的自动回复和自定义菜单会失效。手机端仍显示的旧菜单可能是缓存，点击不会产生本服务可处理的 CLICK 事件。个人或未认证订阅号可将纯文字菜单导入为关键词回复，之后用户需直接发送完整按钮名称；含链接或素材的菜单会整体拒绝，不会只导入一部分。</p>
+            <div class="actions">
+              <button id="readRemoteButton" class="secondary" type="button">读取当前菜单</button>
+              <button id="importKeywordRepliesButton" type="button">导入文字按钮为关键词回复</button>
             </div>
             <pre id="remoteOutput" class="remote-output">尚未读取</pre>
+            <p id="remoteMenuState" class="status" role="status" aria-live="polite"></p>
             <p id="remoteStatus" class="status" role="status" aria-live="polite"></p>
           </div>
+          <details id="apiMenuTools" class="section">
+            <summary>API 菜单高级工具（需要 menu/create 权限）</summary>
+            <div class="details-body">
+              <p class="notice">仅供拥有 menu/create 权限的账号使用。保存草稿只写入本服务；发布才调用微信。公众号读取权限与发布权限相互独立，个人或未认证订阅号通常不能发布。</p>
+              <label class="field">
+                <span>menu/create JSON 草稿</span>
+                <textarea id="menuEditor" class="json menu-editor" spellcheck="false"></textarea>
+              </label>
+              <div class="actions">
+                <button id="saveMenuButton" type="button">保存 API 草稿</button>
+                <button id="publishMenuButton" class="secondary" type="button">发布已保存草稿</button>
+                <button id="importRemoteDraftButton" class="secondary" type="button">导入当前 API 菜单为草稿</button>
+                <button id="deleteRemoteButton" class="danger" type="button">删除远端</button>
+              </div>
+              <p id="menuPermissionStatus" class="status" role="status" aria-live="polite"></p>
+              <p id="menuStatus" class="status" role="status" aria-live="polite"></p>
+            </div>
+          </details>
         </section>
       </div>
     </div>
@@ -634,6 +693,7 @@ const wechatAdminPageHTML = `<!doctype html>
         var error = new Error(message);
         error.status = response.status;
         error.response = response;
+        error.wechatErrorCode = payload && payload.wechat_error_code != null ? payload.wechat_error_code : null;
         if (response.status === 401) {
           sessionStorage.removeItem(tokenStorageKey);
           adminToken = "";
@@ -651,14 +711,51 @@ const wechatAdminPageHTML = `<!doctype html>
       byID("revisionBadge").textContent = "Revision " + String(revision);
     }
 
-    function applyEditableState(state) {
-      state = state || {};
-      rules = clone(state.replies && Array.isArray(state.replies.rules) ? state.replies.rules : []);
-      defaultReply = clone(state.replies ? state.replies.default_reply : null);
-      byID("replyEnabled").checked = Boolean(state.replies && state.replies.enabled);
-      byID("menuEditor").value = JSON.stringify(state.menu || { button: [] }, null, 2);
+    function applyReplyState(replies) {
+      replies = replies || {};
+      rules = clone(Array.isArray(replies.rules) ? replies.rules : []);
+      defaultReply = clone(replies.default_reply || null);
+      byID("replyEnabled").checked = Boolean(replies.enabled);
       renderDefaultReply();
       renderRules();
+    }
+
+    function applyEditableState(state) {
+      state = state || {};
+      applyReplyState(state.replies);
+      byID("menuEditor").value = JSON.stringify(state.menu || { button: [] }, null, 2);
+    }
+
+    function currentMenuButtons(payload) {
+      return payload && payload.selfmenu_info && Array.isArray(payload.selfmenu_info.button) ? payload.selfmenu_info.button : [];
+    }
+
+    function countWebsiteTextButtons(buttons) {
+      return (buttons || []).reduce(function (count, button) {
+        var nested = button && button.sub_button && Array.isArray(button.sub_button.list) ? button.sub_button.list : [];
+        if (nested.length) { return count + countWebsiteTextButtons(nested); }
+        return count + (button && String(button.type || "").toLowerCase() === "text" ? 1 : 0);
+      }, 0);
+    }
+
+    function renderRemoteMenuSummary(payload) {
+      var textCount = countWebsiteTextButtons(currentMenuButtons(payload));
+      if (!payload || (payload.is_menu_open !== 0 && payload.is_menu_open !== 1)) {
+        setStatus("remoteMenuState", "微信响应未包含有效的 is_menu_open 状态", "error");
+        return;
+      }
+      if (payload.is_menu_open === 0) {
+        setStatus("remoteMenuState", "微信报告 is_menu_open=0：当前菜单未开启。手机端旧菜单可能是缓存，点击不会推送 CLICK。检测到 " + String(textCount) + " 个文字按钮；仅纯文字菜单可整体导入。", "error");
+        return;
+      }
+      setStatus("remoteMenuState", "微信报告 is_menu_open=1；检测到 " + String(textCount) + " 个后台文字按钮。读取状态仍不代表拥有 menu/create 发布权限。", textCount ? "pending" : "ok");
+    }
+
+    async function readRemoteMenu() {
+      var result = await request("/api/admin/wechat/menu/remote");
+      byID("remoteOutput").textContent = result.payload ? JSON.stringify(result.payload, null, 2) : result.raw;
+      renderRemoteMenuSummary(result.payload);
+      return result;
     }
 
     async function loadState() {
@@ -847,7 +944,7 @@ const wechatAdminPageHTML = `<!doctype html>
       return error.message;
     }
 
-    async function runOperation(button, statusID, pendingMessage, successMessage, operation) {
+    async function runOperation(button, statusID, pendingMessage, successMessage, operation, onError) {
       button.disabled = true;
       setStatus(statusID, pendingMessage, "pending");
       try {
@@ -855,6 +952,7 @@ const wechatAdminPageHTML = `<!doctype html>
         setStatus(statusID, successMessage, "ok");
       } catch (error) {
         setStatus(statusID, operationError(error), "error");
+        if (onError) { onError(error); }
       } finally {
         button.disabled = false;
       }
@@ -931,7 +1029,8 @@ const wechatAdminPageHTML = `<!doctype html>
       try { menu = JSON.parse(byID("menuEditor").value); }
       catch (error) { setStatus("menuStatus", "菜单 JSON 无效：" + error.message, "error"); return; }
       if (menu && (Object.prototype.hasOwnProperty.call(menu, "is_menu_open") || Object.prototype.hasOwnProperty.call(menu, "selfmenu_info"))) {
-        if (!window.confirm("这是微信查询接口返回的菜单。导入时，官网文本按钮会转换为 click 按钮和精确回复规则。继续？")) { return; }
+        setStatus("menuStatus", "这是查询接口响应，不是 menu/create 草稿。请使用上方关键词导入，或“导入当前 API 菜单为草稿”。", "error");
+        return;
       }
       runOperation(button, "menuStatus", "正在保存...", "菜单草稿已保存", async function () {
         var result = await request("/api/admin/wechat/menu", {
@@ -946,23 +1045,38 @@ const wechatAdminPageHTML = `<!doctype html>
       var button = byID("publishMenuButton");
       runOperation(button, "menuStatus", "正在发布...", "菜单已发布", async function () {
         await request("/api/admin/wechat/menu/publish", { method: "POST", headers: { "If-Match": revisionETag } });
+        setStatus("menuPermissionStatus", "", "");
+      }, function (error) {
+        if (error.wechatErrorCode === 48001) {
+          setStatus("menuPermissionStatus", "微信已确认当前账号没有 menu/create 权限。个人或未认证订阅号无法恢复菜单点击，请使用上方关键词回复。", "error");
+        }
       });
     });
 
     byID("readRemoteButton").addEventListener("click", function () {
       var button = byID("readRemoteButton");
       runOperation(button, "remoteStatus", "正在读取...", "远端菜单已读取", async function () {
-        var result = await request("/api/admin/wechat/menu/remote");
-        byID("remoteOutput").textContent = result.payload ? JSON.stringify(result.payload, null, 2) : result.raw;
+        await readRemoteMenu();
       });
     });
 
-    byID("importRemoteButton").addEventListener("click", function () {
-      if (!window.confirm("导入会覆盖已保存的菜单草稿，并替换上次导入菜单生成的文本回复规则。继续？")) { return; }
-      var button = byID("importRemoteButton");
-      runOperation(button, "remoteStatus", "正在导入...", "远端菜单已导入为草稿", async function () {
-        var remote = await request("/api/admin/wechat/menu/remote");
-        byID("remoteOutput").textContent = remote.payload ? JSON.stringify(remote.payload, null, 2) : remote.raw;
+    byID("importKeywordRepliesButton").addEventListener("click", function () {
+      if (!window.confirm("将当前后台文字按钮导入为精确关键词回复？这会替换上次由本功能生成的规则、启用自动回复并丢弃尚未保存的回复编辑；API 菜单编辑内容不受影响，也不会恢复菜单点击。")) { return; }
+      var button = byID("importKeywordRepliesButton");
+      runOperation(button, "remoteStatus", "正在导入关键词回复...", "文字按钮已导入；用户现在需直接发送完整按钮名称", async function () {
+        var saved = await request("/api/admin/wechat/menu/remote/import-text-replies", {
+          method: "POST", headers: { "If-Match": revisionETag }
+        });
+        updateRevision(saved);
+        if (saved.payload) { applyReplyState(saved.payload.replies); }
+      });
+    });
+
+    byID("importRemoteDraftButton").addEventListener("click", function () {
+      if (!window.confirm("仅当当前远端菜单由 API 创建且 is_menu_open=1 时才能导入。继续并覆盖本地 API 草稿？")) { return; }
+      var button = byID("importRemoteDraftButton");
+      runOperation(button, "menuStatus", "正在导入 API 菜单...", "当前 API 菜单已导入为草稿", async function () {
+        var remote = await readRemoteMenu();
         var body = remote.payload ? JSON.stringify(remote.payload) : remote.raw;
         var saved = await request("/api/admin/wechat/menu", {
           method: "PUT", headers: { "If-Match": revisionETag }, body: body
@@ -978,6 +1092,7 @@ const wechatAdminPageHTML = `<!doctype html>
       runOperation(button, "remoteStatus", "正在删除...", "远端菜单已删除", async function () {
         await request("/api/admin/wechat/menu/remote", { method: "DELETE" });
         byID("remoteOutput").textContent = "远端菜单已删除";
+        setStatus("remoteMenuState", "远端菜单已删除；重新读取可确认微信当前状态", "ok");
       });
     });
 

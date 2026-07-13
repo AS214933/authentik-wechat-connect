@@ -1,6 +1,6 @@
 # Authentik WeChat Connect
 
-A Go middleware service that turns WeChat Official Account QR-code login into a standard OAuth/OIDC provider for Authentik Generic OAuth Sources. It also handles pushed Official Account messages, managed passive replies, and custom menus after server push is enabled.
+A Go middleware service that turns WeChat Official Account login into a standard OAuth/OIDC provider for Authentik Generic OAuth Sources. It also handles pushed Official Account messages, managed passive replies, and API-managed custom menus for accounts authorized to publish them.
 
 ## Login Flow
 
@@ -16,6 +16,8 @@ WeChat only authorizes `qrcode/create` for verified Service Accounts. With the d
 
 ## Endpoints
 
+All paths below belong to this middleware. WeChat only receives and calls the `/wechat/callback` URL configured in its console; Authentik uses the OIDC paths, the browser uses scan paths, and the management page uses `/api/admin/...` internally.
+
 - Discovery: `/.well-known/openid-configuration`
 - Authorize: `/oauth/authorize`
 - Token: `/oauth/token`
@@ -28,6 +30,7 @@ WeChat only authorizes `qrcode/create` for verified Service Accounts. With the d
 - Menu draft: `PUT /api/admin/wechat/menu`
 - Publish menu: `POST /api/admin/wechat/menu/publish`
 - Read/delete remote menu: `GET|DELETE /api/admin/wechat/menu/remote`
+- Import website text menus as keyword replies: `POST /api/admin/wechat/menu/remote/import-text-replies`
 - Scan page: `/scan/{id}`
 - Scan status: `/api/scan/{id}`
 - Health check: `/healthz`
@@ -46,7 +49,7 @@ Set the WeChat callback token to the exact same value as `WECHAT_CALLBACK_TOKEN`
 - Compatibility and safe modes verify `msg_signature`, decrypt the callback with `WECHAT_ENCODING_AES_KEY`, validate the embedded AppID, and encrypt passive replies. Safe mode is recommended.
 - The EncodingAESKey is the 43-character value configured in the WeChat console. `WECHAT_APP_ID` must also be set when AES is enabled.
 
-Enabling server push disables the automatic replies and custom menus configured on the WeChat website. Configure replacements through this service before enabling push. The website has no API that can write those old rules, so this service stores its own managed rules.
+Enabling message push (formerly server configuration) disables the automatic replies and custom menus configured on the WeChat website. A cached old menu may remain visible in a client, but tapping it does not turn a website `text/value` action into a `CLICK/EventKey` callback. Configure replacement replies through this service before enabling push. The website has no API that can write those old rules, so this service stores its own managed rules.
 
 For verified Service Accounts, the service uses temporary parameterized QR codes:
 
@@ -78,9 +81,12 @@ Reply rules are ordered and use the first match. They can match standard message
 
 Passive reply types are text, image, voice, video, music, news, official AI, and customer-service transfer. Media replies require a Media ID already uploaded to WeChat. Official AI emits the documented `transfer_biz_ai_ivr` message type; it only works for standard user messages when the account has WeChat AI reply enabled and its historical articles have finished training. It is distinct from `transfer_customer_service`.
 
-The menu editor saves a local draft first. **Save draft does not change WeChat.** Publish explicitly calls `/cgi-bin/menu/create`; reading the remote menu calls `/cgi-bin/get_current_selfmenu_info`; deleting calls `/cgi-bin/menu/delete`. The current-menu response uses a different shape from the create request (`selfmenu_info.button` and `sub_button.list`) and may contain website-only actions. Use **Import as draft** to normalize it. Website `text` actions are converted to `click` buttons plus exact managed reply rules; website `img`, `voice`, `video`, and `news` actions are rejected because their returned temporary/download fields cannot be reused as permanent API media. WeChat may take about five minutes to refresh clients.
+The management page exposes two deliberately separate paths:
 
-Reading and publishing have different account permissions. An account may be allowed to call `/cgi-bin/get_current_selfmenu_info` but not `/cgi-bin/menu/create`; unverified Subscription Accounts generally cannot publish API-managed menus. Publishing also requires the AppSecret API-call IP allowlist to include this service.
+- For a personal or unverified Subscription Account, **Import text buttons as keyword replies** reads `/cgi-bin/get_current_selfmenu_info` and creates exact text rules whose patterns are the button names. Users then send the complete button name in the conversation; this does not restore tapping the disabled website menu. The import enables managed replies, changes replies only, preserves the API menu draft and hand-written rules, and replaces only a previous keyword import. It atomically rejects duplicate names, eight-digit numeric names reserved for login, mixed non-text actions, invalid reply content, and any keyword shadowed by an existing enabled rule.
+- The advanced API menu editor saves a local `menu/create` draft. **Save draft does not change WeChat.** Publish explicitly calls `/cgi-bin/menu/create`; reading the current menu calls `/cgi-bin/get_current_selfmenu_info`; deleting calls `/cgi-bin/menu/delete`. Only an active (`is_menu_open=1`) API-shaped current menu can be imported as a draft. Website-only `text`, `img`, `voice`, `video`, and `news` actions are never fabricated into API `click/key` actions.
+
+Reading and publishing have different account permissions. An account may be allowed to call `/cgi-bin/get_current_selfmenu_info` but not `/cgi-bin/menu/create`. The official permission table marks Subscription Account menu creation as `仅认证`, defined as enterprise-subject verified accounts only; personal and unverified Subscription Accounts therefore cannot publish API-managed menus. Publishing also requires the AppSecret API-call IP allowlist to include this service. A `48001` publish failure leaves the saved draft, reply rules, and management revision unchanged.
 
 Example menu draft:
 
@@ -203,8 +209,10 @@ docker run --rm -p 8080:8080 --env-file .env \
 
 - Authentik Federated identity providers: https://docs.goauthentik.io/users-sources/sources/social-logins/
 - WeChat Subscription Account custom menus: https://developers.weixin.qq.com/doc/subscription/guide/product/menu/intro.html
-- WeChat current custom menu response: https://developers.weixin.qq.com/doc/subscription/api/custommenu/api_getcurrentselfmenuinfo
-- WeChat custom menu creation: https://developers.weixin.qq.com/doc/subscription/api/custommenu/api_createcustommenu
+- WeChat message-push behavior: https://developers.weixin.qq.com/doc/subscription/guide/dev/push/
+- WeChat current custom menu response: https://developers.weixin.qq.com/doc/subscription/api/custommenu/api_getcurrentselfmenuinfo.html
+- WeChat custom menu creation and account permissions: https://developers.weixin.qq.com/doc/subscription/api/custommenu/api_createcustommenu.html
+- WeChat custom-menu event callbacks: https://developers.weixin.qq.com/doc/subscription/guide/product/menu/Custom_Menu_Push_Events.html
 - WeChat Subscription Account standard messages: https://developers.weixin.qq.com/doc/subscription/guide/product/message/Receiving_standard_messages.html
 - WeChat event callbacks: https://developers.weixin.qq.com/doc/service/guide/product/message/Receiving_event_pushes.html
 - WeChat parameterized QR codes: https://developers.weixin.qq.com/doc/service/api/qrcode/qrcodes/api_createqrcode.html
